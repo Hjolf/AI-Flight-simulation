@@ -1,0 +1,1134 @@
+using System;
+using UnityEngine;
+using CustomLibrary;
+using System.Collections.Generic;
+using System.Collections;
+using UnityEngine.Networking;
+using TMPro;
+using System.IO;
+using UnityEngine.Playables;
+using System.Runtime.Serialization.Formatters.Binary;
+using System.Xml.Linq;
+using Unity.VisualScripting;
+using static System.Net.WebRequestMethods;
+using System.Text.RegularExpressions;
+using System.Linq;
+using static UnityEngine.Rendering.DebugUI.Table;
+using UnityEditor;
+using static UnityEngine.GraphicsBuffer;
+using static RadarController.RadarAircraft;
+using JetBrains.Annotations;
+using static AirportDatabase.Airport.Runway.RunwayEnd;
+
+public class GameBehaviour : MonoBehaviour
+{
+    AirportDatabase adb;
+
+    public const float metersToFeet = 3.28084f;
+    public const float metersToKnots = 1.943845f;
+    public const float hpaToInhg = 0.02952998f;
+    public const float metersToNauticalMiles = 0.0005399568f;
+
+    public enum WindDescription { Calm, LightAir, LightBreeze, GentleBreeze, ModerateBreeze, FreshBreeze, StrongBreeze, NearGale, Gale, StrongGale, Storm, ViolentStorm, Hurricane };
+
+    public bool networkingRequests = true;
+    public bool generateGround = false;
+
+    [Space(20)]
+
+    // Change to go through list of aircrafts, also change for plane tags
+    public A320Systems a320System;
+
+    AudioListener listener;
+
+    public Transform audioObject;
+    public float speedOfSound;
+    public AnimationCurve airDensityCurve;
+
+    [Header("Climate properties")]
+    public float dryAirSpecificConstant;
+    public float waterVaporSpecificConstant;
+
+    [Header("Humidity")]
+    [Range(0, 100)]
+    public float maxHumidityWaterVaporContent;
+
+    [Header("Pressure")]
+    public AnimationCurve atmosphericPressureByAltitude;
+    public float maxAtmosphericAltitude;
+    public float pressureScaling;
+    public float pressureDifferential;
+    public float pressureUpwardsShift;
+    public float standardPressure_hPa;
+
+    [Header("Temperature")]
+    public float standardTempLapseRate;
+    public float tempLapseAltitudeSpacing;
+
+    [Header("Winds")]
+    public Vector3 windShift;
+    public Vector3 turbulenceShift;
+    public float groundWindScaling;
+    public float windFlowTurbulenceScaling;
+    [Range(-1, 1)]
+    public float windTurbulentFlowSharpness = 0;
+    [Range(0, 1)]
+    public float turbulenceStrength = 0;
+    public float meanWindAltitudeExponent;
+    public float meanWindRefAltitude;
+    [Range(1, 255)]
+    public int windSeed = 1;
+    [Range(1, 255)]
+    public int turbulentFlowSeed = 1;
+
+    [Header("Audio properties")]
+    public List<ClipToPlay> audioQueue;
+
+    public AnimationCurve dopplerCurve;
+    public float maxDopplerVelocity;
+    [Range(0, 1)]
+    public float dopplerLevel;
+
+    public AnimationCurve rangeBySpeedCurve;
+    public AnimationCurve rangeMultiplierByAngleCurve;
+
+    [Header("Conversions")]
+    public AnimationCurve pressureAltitudeChart;
+    public enum DistanceUnit { Meters, NauticalMiles };
+    public enum AltitudeUnit { Feet, Meters };
+
+    [Header("Networking")]
+    public string IPGeolocationAPIAuthKey;
+    public string flightRoutesAPIAuthKey;
+    public string depAirportICAOToSearch;
+    public string timeUrl;
+    public Time24Hour localTime;
+    int utcOffset;
+    public Time24Hour zuluTime;
+    public int requestsLeft;
+
+    [Space(5)]
+    public List<FlightRoute> flightRoutes = new();
+    public List<LiveFlight> liveFlights = new();
+
+    [Header("UI")]
+    public TMP_Text timeText;
+    public TMP_Text coordinateText;
+    public TMP_Text airacInfo;
+    public UIElement screenFade;
+    public RectTransform pfdMapMask;
+    public RectTransform pfdWaypointPrefab;
+    public float pdfScaling;
+
+    public bool tagsVisible = false;
+    public RectTransform planeTagPrefab;
+    public RectTransform planeTagParent;
+    List<PlaneTag> planeTags = new();
+
+    [Header("Geological data (scale in meters)")]
+    public long earthDiameterEquator;
+    public long earthDiameterPoles;
+    public Transform coordinateReferencePoint;
+    public Coordinates coordinateReference;
+
+    [Header("Precalculated data")]
+    public long earthCircumferenceEquator;
+    public long earthCircumeferencePoles;
+
+    public List<WorldTile> worldTiles = new();
+
+    [Header("File reading & nav data")]
+    public string cycleInfoFilePath;
+    public string navFixFilePath;
+
+    public NavData completeNavData;
+
+    [HideInInspector]
+    public bool navDataLoaded = false;
+
+    Vector3 shiftedWind;
+    Vector3 shiftedTurbulence;
+
+    SmoothVector2 windVelo = new SmoothVector2(new(), new Vector2(-1000, 1000), new Vector2(-1000, 1000), 0.3f);
+    SmoothVector2 turbulentFlowVelo = new SmoothVector2(new(), new Vector2(-1000, 1000), new Vector2(-1000, 1000), 0.3f);
+
+
+    [Serializable]
+    public class PlaneTag
+    {
+        public RectTransform rect;
+        public A320Systems system;
+        public UIGroup ui;
+        public TMP_Text flightNr;
+        public TMP_Text distance;
+
+
+        public PlaneTag(RectTransform parent, RectTransform prefab, A320Systems _system)
+        {
+            rect = Instantiate(prefab, parent);
+            system = _system;
+            ui = rect.gameObject.GetComponent<UIGroup>();
+            ui.SetAlpha(0, true);
+            rect.gameObject.name = system.mCDU.initPage.flightNumber + "_tag";
+
+            flightNr = rect.transform.Find("info_box").transform.Find("flight_number").GetComponent<TMP_Text>();
+            distance = rect.transform.Find("info_box").transform.Find("distance").GetComponent<TMP_Text>();
+        }
+
+        public void Update(GameBehaviour gbRef, bool tagsVisible)
+        {
+            Vector3 screenPos = Camera.main.WorldToScreenPoint(system.transform.position);
+            Coordinates camCoordinates = new Coordinates();
+            camCoordinates.Update(Camera.main.transform.position, gbRef);
+            float dist = gbRef.DistanceBetweenCoordinates(camCoordinates, system.coordinatePosition, DistanceUnit.NauticalMiles);
+            screenPos.z = 0;
+            rect.position = screenPos;
+
+            flightNr.text = system.mCDU.initPage.flightNumber;
+            distance.text = dist.ToString("f1") + "Nm";
+
+            Vector3 centeredScreenPos = new Vector3(screenPos.x - Screen.width / 2, screenPos.y - Screen.height / 2, 0);
+            float trueRot = Vector2.Angle(Vector2.up, centeredScreenPos) * Mathf.Deg2Rad;
+            float edgePos = Mathf.Min(((Screen.width / 2) - 20) / Mathf.Abs(Mathf.Sin(trueRot)), ((Screen.height / 2) - 20) / Mathf.Abs(Mathf.Cos(trueRot)));
+
+            float distanceToCenter = Vector2.Distance(Vector2.zero, centeredScreenPos);
+
+            if (tagsVisible)
+            {
+                if (distanceToCenter > edgePos - 10)
+                {
+                    ui.SetAlpha(0, false);
+                }
+                else
+                {
+                    ui.SetAlpha(1, false);
+                }
+            }
+            else
+            {
+                ui.SetAlpha(0, false);
+            }
+        }
+    }
+
+    [Serializable]
+    public class FlightRoute
+    {
+        public string airline_iata;
+        public string airline_icao;
+        public string flight_number;
+        public string flight_iata;
+        public string flight_icao;
+        public string cs_airline_iata;
+        public string cs_flight_iata;
+        public string cs_flight_number; 
+        public string dep_iata;
+        public string dep_icao;
+        public string dep_time;
+        public string dep_time_utc;
+        public List<string> dep_terminals = new();
+        public string arr_iata;
+        public string arr_icao;
+        public string arr_time;
+        public string arr_time_utc;
+        public List<string> arr_terminals = new();
+        public int duration;
+        public List<string> days = new();
+        public string aircraft_icao;
+        public DateTime updated;
+
+
+        public FlightRoute(string airline_iata, string airline_icao, string flight_number, string flight_iata, string flight_icao, string cs_airline_iata, string cs_flight_iata, string cs_flight_number, string dep_iata, string dep_icao, string dep_time, string dep_time_utc, string dep_terminals, string arr_iata, string arr_icao, string arr_time, string arr_time_utc, string arr_terminals, string duration, string days, string aircraft_icao, string updated)
+        {
+            this.airline_iata = airline_iata.Replace("\"", "");
+            this.airline_icao = airline_icao.Replace("\"", "");
+            this.flight_number = flight_number.Replace("\"", "");
+            this.flight_iata = flight_iata.Replace("\"", "");
+            this.flight_icao = flight_icao.Replace("\"", "");
+            this.cs_airline_iata = cs_airline_iata.Replace("\"", "");
+            this.cs_flight_iata = cs_flight_iata.Replace("\"", "");
+            this.cs_flight_number = cs_flight_number.Replace("\"", "");
+            this.dep_iata = dep_iata.Replace("\"", "");
+            this.dep_icao = dep_icao.Replace("\"", "");
+            this.dep_time = dep_time.Replace("\"", "");
+            this.dep_time_utc = dep_time_utc.Replace("\"", "");
+
+            int newCount = 0;
+            string newStr = "";
+            newStr = dep_terminals.Replace("\"", "").Replace("[", "").Replace("]", "").Trim();
+            newCount = newStr.Count(f => f == ',') + 1;
+
+            for(int i = 0; i < newCount; i++)
+            {
+                if(newCount > 1)
+                {
+                    this.dep_terminals.Add(newStr.Split(',')[i]);
+                }
+                else
+                {
+                    this.dep_terminals.Add(newStr);
+                }
+            }
+            
+            this.arr_iata = arr_iata.Replace("\"", "");
+            this.arr_icao = arr_icao.Replace("\"", "");
+            this.arr_time = arr_time.Replace("\"", "");
+            this.arr_time_utc = arr_time_utc.Replace("\"", "");
+
+            newStr = arr_terminals.Replace("\"", "").Replace("[", "").Replace("]", "").Trim();
+            newCount = newStr.Count(f => f == ',') + 1;
+
+            for (int i = 0; i < newCount; i += 2)
+            {
+                if (newCount > 1)
+                {
+                    this.arr_terminals.Add(newStr.Split(',')[i]);
+                }
+                else
+                {
+                    this.arr_terminals.Add(newStr);
+                }
+            }
+
+            this.duration = int.Parse(duration);
+
+            newStr = days.Replace("\"", "").Replace("[", "").Replace("]", "").Trim();
+            newCount = newStr.Count(f => f == ',') + 1;
+
+            for (int i = 0; i < newCount; i += 2)
+            {
+                if (newCount > 1)
+                {
+                    this.days.Add(newStr.Split(',')[i]);
+                }
+                else
+                {
+                    this.days.Add(newStr);
+                }
+            }
+
+            this.aircraft_icao = aircraft_icao.Replace("\"", "");
+            updated = updated.Replace("\"", "");
+            this.updated = new DateTime(int.Parse(updated.Split('-')[0]), int.Parse(updated.Split('-')[1].Split('-')[0]), int.Parse(updated.Split('-')[2].Split('T')[0]), int.Parse(updated.Split('T')[1].Split(':')[0]), int.Parse(updated.Split(':')[1].Split(':')[0]), int.Parse(updated.Split(':')[2].Split('.')[0]));
+        }
+    }
+
+    [Serializable]
+    public class LiveFlight
+    {
+        public string hex;
+        public string reg_number;
+        public string flag;
+        public Coordinates coordinates = new();
+        public int alt;
+        public int dir;
+        public int speed;
+        public float v_speed;
+        public string squawk;
+        public string flight_number;
+        public string flight_icao;
+        public string flight_iata;
+        public string dep_icao;
+        public string dep_iata;
+        public string arr_icao;
+        public string arr_iata;
+        public string airline_icao;
+        public string airline_iata;
+        public string aircraft_icao;
+        public DateTime updated;
+        public string status;
+
+
+        public LiveFlight(string hex, string reg_number, string flag, string lat, string lng, string alt, string dir, string speed, string v_speed, string squawk, string flight_number, string flight_icao, string flight_iata, string dep_icao, string dep_iata, string arr_icao, string arr_iata, string airline_icao, string airline_iata, string aircraft_icao, string updated, string status)
+        {
+            this.hex = hex.Replace("\"", "");
+            this.reg_number = reg_number.Replace("\"", "");
+            this.flag = flag.Replace("\"", "");
+            if(lat != "null" && lng != "null")
+            {
+                coordinates = new Coordinates(double.Parse(lat), double.Parse(lng));
+            }
+            if(alt != "null")
+            {
+                this.alt = int.Parse(alt);
+            }
+            if(dir != "null")
+            {
+                if (dir.Contains('.'))
+                {
+                    dir = dir.Split('.')[0];
+                }
+                this.dir = int.Parse(dir);
+            }
+            if(speed != "null")
+            {
+                this.speed = int.Parse(speed);
+            }
+            if(v_speed != "null")
+            {
+                this.v_speed = float.Parse(v_speed);
+            }
+            this.squawk = squawk.Replace("\"", "");
+            this.flight_number = flight_number.Replace("\"", "");
+            this.flight_icao = flight_icao.Replace("\"", "");
+            this.flight_iata = flight_iata.Replace("\"", "");
+            this.dep_icao = dep_icao.Replace("\"", "");
+            this.dep_iata = dep_iata.Replace("\"", "");
+            this.arr_icao = arr_icao.Replace("\"", "");
+            this.arr_iata = arr_iata.Replace("\"", "");
+            this.airline_icao = airline_icao.Replace("\"", "");
+            this.airline_iata = airline_iata.Replace("\"", "");
+            this.aircraft_icao = aircraft_icao.Replace("\"", "");
+            //this.updated = updated;
+            this.status = status.Replace("\"", "");
+        }
+    }
+
+    [Serializable]
+    public class NavData
+    {
+        public string airacCycle = "";
+        public string airacVersion = "";
+        public string airacValid = "";
+
+        public List<string> rjNavFixes = new();
+        public List<string> visibleFixes = new();
+        public List<string> uniqueEndings = new();
+
+        public List<FlightWaypoint> waypointRef = new();
+
+
+        public void UpdateAIRACData(string cycleInfoFilePath)
+        {
+            string[] lines;
+            string path = Application.persistentDataPath + cycleInfoFilePath;
+
+            StreamReader reader = new StreamReader(path);
+            lines = reader.ReadToEnd().Split('\n');
+            reader.Close();
+
+            airacCycle = lines[0].Split(':')[1].Replace(" ", "");
+            airacVersion = lines[1].Split(':')[1].Replace(" ", "");
+            airacValid = lines[2].Split(':')[1].Replace(" ", "");
+        }
+
+        public void UpdateNavFixes(string navFixFilePath, AirportDatabase adb, GameBehaviour gbRef)
+        {
+            string path = Application.persistentDataPath + navFixFilePath;
+            string[] strLines;
+
+            StreamReader reader = new StreamReader(path);
+            strLines = reader.ReadToEnd().Split('\n');
+            reader.Close();
+
+            foreach(string str in strLines)
+            {
+                if(str.Contains(" RJ "))
+                {
+                    rjNavFixes.Add(str);
+                    double latParsed = double.Parse(str.Split("  ")[0].Replace(" ", ""));
+                    double longParsed = double.Parse(str.Split("  ")[1].Split("  ")[0]);
+
+                    string endMark = str.Substring(44).Replace(" ", "");
+                    if (!uniqueEndings.Contains(endMark))
+                    {
+                        uniqueEndings.Add(endMark);
+                    }
+
+                    float distanceToCenter = gbRef.DistanceBetweenCoordinates(adb.airports[0].coordinates, new Coordinates(latParsed, longParsed), DistanceUnit.NauticalMiles);
+
+                    if (distanceToCenter <= 48)
+                    {
+                        if(latParsed / Mathf.RoundToInt((float)latParsed) != 1 || longParsed / Mathf.RoundToInt((float)longParsed) != 1)
+                        {
+                            visibleFixes.Add(str);
+                        }
+                    }
+                }
+            }
+
+            foreach(string str in visibleFixes)
+            {
+                string designation = str.Substring(28);
+                designation = designation.Substring(0, 8).Replace(" ", "");
+                Coordinates crd = new Coordinates(double.Parse(str.Split("  ")[0].Replace(" ", "")), double.Parse(str.Split("  ")[1].Split("  ")[0]));
+                waypointRef.Add(adb.CreateWaypointFromNavData(new AirportDatabase.FlightWaypointRef(designation, crd, 0, 0)));
+            }
+        }
+    }
+
+    [Serializable]
+    public class WorldTile
+    {
+        [Serializable]
+        public class SubTile
+        {
+            public List<Vector3> points = new();
+            public Transform mesh;
+            public int index;
+
+
+            public SubTile(List<Vector3> ps, int _index)
+            {
+                points.AddRange(ps);
+                index = _index;
+            }
+        }
+
+        public int latitude;
+        public int longitude;
+        public int latitudinalTiles;
+        public int longitudinalTiles;
+
+        [Header("Precalculated data")]
+        GameObject obj;
+
+        public string tileName;
+        public List<Vector3> boundaryPoints = new();
+        public List<SubTile> subTiles = new();
+
+
+        public void Init(GameBehaviour gb)
+        {
+            string latStart = "";
+            string longStart = "";
+
+            if(Mathf.Sign((float)latitude) > 0)
+            {
+                latStart = "+";
+            }
+            else if(Mathf.Sign((float)latitude) < 0)
+            {
+                latStart = "-";
+            }
+            if (Mathf.Sign((float)longitude) > 0)
+            {
+                longStart = "+";
+            }
+            else if (Mathf.Sign((float)longitude) < 0)
+            {
+                longStart = "-";
+            }
+            tileName = latStart + Mathf.Abs((float)latitude).ToString("f0") + longStart + " " + Mathf.Abs((float)longitude).ToString("f0");
+
+            boundaryPoints.Add(CoordinatesToPosition(gb, latitude, longitude));
+            boundaryPoints.Add(CoordinatesToPosition(gb, latitude, longitude + 1));
+            boundaryPoints.Add(CoordinatesToPosition(gb, latitude + 1, longitude + 1));
+            boundaryPoints.Add(CoordinatesToPosition(gb, latitude + 1, longitude));
+
+            GameObject _obj = new("world_tile_" + tileName);
+            obj = _obj;
+
+            obj.transform.position = new Vector3((boundaryPoints[0].x + boundaryPoints[1].x) / 2, 0, (boundaryPoints[1].z + boundaryPoints[2].z) / 2);
+
+            int ind = 0;
+            for(int z = 0; z < latitudinalTiles; z++)
+            {
+                for (int x = 0; x < longitudinalTiles; x++)
+                {
+                    List<Vector3> points = new();
+
+                    points.Add(CoordinatesToPosition(gb, latitude + (z / (float)latitudinalTiles), longitude + (x / (float)longitudinalTiles)));
+                    points.Add(CoordinatesToPosition(gb, latitude + (z / (float)latitudinalTiles), longitude + (x / (float)longitudinalTiles) + (1 / (float)longitudinalTiles)));
+                    points.Add(CoordinatesToPosition(gb, latitude + (z / (float)latitudinalTiles) + (1 / (float)latitudinalTiles), longitude + (x / (float)longitudinalTiles) + (1 / (float)longitudinalTiles)));
+                    points.Add(CoordinatesToPosition(gb, latitude + (z / (float)latitudinalTiles) + (1 / (float)latitudinalTiles), longitude + (x / (float)longitudinalTiles)));
+
+                    subTiles.Add(new SubTile(points, ind));
+                    ind++;
+                }
+            }
+
+            foreach(SubTile st in subTiles)
+            {
+                GameObject _mesh = new("tile_mesh_" + st.index);
+                _mesh.AddComponent<MeshRenderer>();
+                MeshFilter meshFilter = _mesh.AddComponent<MeshFilter>();
+                Renderer rend = _mesh.GetComponent<Renderer>();
+                Mesh mesh = meshFilter.mesh;
+
+                //_mesh.transform.localPosition = new Vector3((st.points[0].x + st.points[1].x) / 2, 0, (st.points[1].z + st.points[2].z) / 2);
+
+                List<int> newTriangles = new()
+                {
+                    0,
+                    3,
+                    1,
+                    1,
+                    3,
+                    2
+                };
+
+                Vector2[] uvs = new Vector2[]
+                {
+                    new Vector2(0, 0),
+                    new Vector2(1, 0),
+                    new Vector2(1, 1),
+                    new Vector2(0, 1),
+                };
+
+                mesh.Clear();
+                mesh.vertices = st.points.ToArray();
+                mesh.triangles = newTriangles.ToArray();
+                mesh.uv = uvs;
+
+                mesh.Optimize();
+                mesh.RecalculateNormals();
+
+                _mesh.transform.SetParent(obj.transform);
+
+                Material mat = new Material(Shader.Find("HDRP/Lit"));
+                mat.SetColor("_BaseColor", new Color(1f, 1f, 1f));
+                rend.material = mat;
+                rend.material.mainTexture = Resources.Load<Texture2D>("103680_232384_BI18");
+            }
+        }
+
+        public Vector3 CoordinatesToPosition(GameBehaviour gb, double lat, double lon)
+        {
+            float zPos = gb.coordinateReferencePoint.transform.position.z + (float)(lat - gb.coordinateReference.latitude) * 110900;
+            float longMetersPerDegree = Mathf.PI / 180 * (6367449 * Mathf.Cos((float)lat * Mathf.Deg2Rad));
+            float xPos = gb.coordinateReferencePoint.transform.position.x + (float)(lon - gb.coordinateReference.longitude) * longMetersPerDegree;
+
+            return new Vector3(xPos, 0, zPos);
+        }
+    }
+
+    [Serializable]
+    public class WeatherCondition
+    {
+        [Tooltip("knots")]
+        public float windSpeed;
+        [Range(0, 359)]
+        public float windDirection;
+        [HideInInspector]
+        public Vector2 windVelocity;
+        public float cleanWindSpeed;
+        public float cleanWindDirection;
+        [HideInInspector]
+        public Vector2 cleanWindVelocity;
+        public WindDescription windDescription;
+
+        [Tooltip("Kg/m³")]
+        public float airDensity;
+        public float temperatureC;
+        public float temperatureK;
+        public float absolutePressure_hPa;
+        public float humidity;
+        [Tooltip("m/s")]
+        public float speedOfSound;
+    }
+
+
+
+    public void Awake()
+    {
+        listener = Camera.main.gameObject.GetComponent<AudioListener>();
+
+        screenFade.SetState(false);
+
+        adb = gameObject.GetComponent<AirportDatabase>();
+
+        windVelo.Init();
+        turbulentFlowVelo.Init();
+    }
+
+    IEnumerator Start()
+    {
+        planeTags.Add(new PlaneTag(planeTagParent, planeTagPrefab, a320System));
+
+        if (generateGround)
+        {
+            foreach (WorldTile wt in worldTiles)
+            {
+                wt.Init(this);
+            }
+        }
+
+        DateTime UTCTime = DateTime.Now.ToUniversalTime(); // Current date/time
+        TimeZoneInfo otherTimezone = TimeZoneInfo.FindSystemTimeZoneById("Tokyo Standard Time"); // Get other timezone
+        DateTime UTC9Time = TimeZoneInfo.ConvertTimeFromUtc(UTCTime, otherTimezone); // New Timezone
+        TimeSpan timezoneOffset = otherTimezone.GetUtcOffset(UTCTime);
+
+        utcOffset = timezoneOffset.Hours;
+        localTime.InitByString(new string(UTC9Time.Hour.ToString("00") + ":" + UTC9Time.Minute.ToString("00") + ":" + UTC9Time.Second.ToString("00")));
+        zuluTime.InitByString(new string(UTCTime.Hour.ToString("00") + ":" + UTCTime.Minute.ToString("00") + ":" + UTCTime.Second.ToString("00")));
+
+        if (networkingRequests)
+        {
+            string url = timeUrl;
+            /*
+            url = timeUrl.Replace("API_KEY", IPGeolocationAPIAuthKey);
+
+            using (UnityWebRequest webRequest = UnityWebRequest.Get(timeUrl))
+            {
+                // Request and wait for the desired page.
+                yield return webRequest.SendWebRequest();
+
+                string[] pages = timeUrl.Split('/');
+                int page = pages.Length - 1;
+
+                switch (webRequest.result)
+                {
+                    case UnityWebRequest.Result.ConnectionError:
+                    case UnityWebRequest.Result.DataProcessingError:
+                        Debug.LogError(pages[page] + ": Error: " + webRequest.error);
+                        break;
+                    case UnityWebRequest.Result.ProtocolError:
+                        Debug.LogError(pages[page] + ": HTTP Error: " + webRequest.error);
+                        break;
+                    case UnityWebRequest.Result.Success:
+                        Debug.Log(pages[page] + ":\nReceived: " + webRequest.downloadHandler.text);
+                        ParseDateAndTime(webRequest.downloadHandler.text);
+                        break;
+                }
+            }
+            */
+
+            // Route data
+            url = "https://airlabs.co/api/v9/routes?dep_icao=MIA&api_key=YOUR-API-KEY";
+            url = url.Replace("YOUR-API-KEY", flightRoutesAPIAuthKey);
+            url = url.Replace("MIA", depAirportICAOToSearch);
+
+            using (UnityWebRequest webRequest = UnityWebRequest.Get(url))
+            {
+                // Request and wait for the desired page.
+                yield return webRequest.SendWebRequest();
+
+                string[] pages = url.Split("/");
+                int page = pages.Length - 1;
+
+                switch (webRequest.result)
+                {
+                    case UnityWebRequest.Result.ConnectionError:
+                    case UnityWebRequest.Result.DataProcessingError:
+                        Debug.LogError(pages[page] + ": Error: " + webRequest.error);
+                        break;
+                    case UnityWebRequest.Result.ProtocolError:
+                        Debug.LogError(pages[page] + ": HTTP Error: " + webRequest.error);
+                        break;
+                    case UnityWebRequest.Result.Success:
+                        Debug.Log(pages[page] + ":\nReceived: " + webRequest.downloadHandler.text);
+
+                        string path = "Assets/Resources/routes.txt";
+                        StreamWriter writer = new StreamWriter(path, false);
+                        string fullStr = webRequest.downloadHandler.text;
+                        string firstLine = fullStr.Split("response\":[{")[0];
+                        string[] lines = fullStr.Split("},{");
+                        lines[0] = firstLine;
+                        lines[lines.Length - 1] = lines[lines.Length - 1].Split("}],")[0];
+                        foreach (string str in lines)
+                        {
+                            writer.WriteLine(str);
+                        }
+                        writer.Close();
+
+                        foreach(string str in lines)
+                        {
+                            if (str != firstLine)
+                            {
+                                flightRoutes.Add(new FlightRoute(str.Split("airline_iata\":")[1].Split(',')[0], str.Split("airline_icao\":")[1].Split(',')[0], str.Split("flight_number\":")[1].Split(',')[0], str.Split("flight_iata\":")[1].Split(',')[0],
+                                    str.Split("flight_icao\":")[1].Split(',')[0], str.Split("cs_airline_iata\":")[1].Split(',')[0], str.Split("cs_flight_iata\":")[1].Split(',')[0], str.Split("cs_flight_number\":")[1].Split(',')[0],
+                                    str.Split("dep_iata\":")[1].Split(',')[0], str.Split("dep_icao\":")[1].Split(',')[0], str.Split("dep_time\":")[1].Split(',')[0], str.Split("dep_time_utc\":")[1].Split(',')[0],
+                                    str.Split("dep_terminals\":")[1].Split(',')[0], str.Split("arr_iata\":")[1].Split(',')[0], str.Split("arr_icao\":")[1].Split(',')[0], str.Split("arr_time\":")[1].Split(',')[0],
+                                    str.Split("arr_time_utc\":")[1].Split(',')[0], str.Split("arr_terminals\":")[1].Split(',')[0], str.Split("duration\":")[1].Split(',')[0], str.Split("days\":")[1].Split(',')[0],
+                                    str.Split("aircraft_icao\":")[1].Split(',')[0], str.Split("updated\":")[1].Split(',')[0]));
+                            }
+                        }
+
+                        break;
+                }
+            }
+
+            // Live flight data
+            url = "https://airlabs.co/api/v9/flights?arr_icao=MIA&api_key=YOUR-API-KEY";
+            url = url.Replace("YOUR-API-KEY", flightRoutesAPIAuthKey);
+            url = url.Replace("MIA", depAirportICAOToSearch);
+
+            using (UnityWebRequest webRequest = UnityWebRequest.Get(url))
+            {
+                // Request and wait for the desired page.
+                yield return webRequest.SendWebRequest();
+
+                string[] pages = url.Split("/");
+                int page = pages.Length - 1;
+
+                switch (webRequest.result)
+                {
+                    case UnityWebRequest.Result.ConnectionError:
+                    case UnityWebRequest.Result.DataProcessingError:
+                        Debug.LogError(pages[page] + ": Error: " + webRequest.error);
+                        break;
+                    case UnityWebRequest.Result.ProtocolError:
+                        Debug.LogError(pages[page] + ": HTTP Error: " + webRequest.error);
+                        break;
+                    case UnityWebRequest.Result.Success:
+                        Debug.Log(pages[page] + ":\nReceived: " + webRequest.downloadHandler.text);
+
+                        string path = "Assets/Resources/live_flights.txt";
+                        StreamWriter writer = new StreamWriter(path, false);
+                        string fullStr = webRequest.downloadHandler.text;
+                        string firstLine = fullStr.Split("response\":[{")[0];
+                        string[] lines = fullStr.Split("},{");
+                        lines[0] = firstLine;
+                        lines[lines.Length - 1] = lines[lines.Length - 1].Split("}],")[0];
+                        foreach (string str in lines)
+                        {
+                            writer.WriteLine(str);
+                        }
+                        writer.Close();
+
+                        foreach(string str in lines)
+                        {
+                            if(str.Contains("flight_number") && str.Contains("flight_icao") && str.Contains("flight_iata"))
+                            {
+                                liveFlights.Add(new LiveFlight(str.Split("hex\":")[1].Split(',')[0], str.Split("reg_number\":")[1].Split(',')[0], str.Split("flag\":")[1].Split(',')[0], str.Split("lat\":")[1].Split(',')[0],
+                                    str.Split("lng\":")[1].Split(',')[0], str.Split("alt\":")[1].Split(',')[0], str.Split("dir\":")[1].Split(',')[0], str.Split("speed\":")[1].Split(',')[0], str.Contains("v_speed\":") ? str.Split("v_speed\":")[1].Split(',')[0] : "0",
+                                    str.Contains("squawk\":") ? str.Split("squawk\":")[1].Split(',')[0] : "", str.Contains("flight_number\":") ? str.Split("flight_number\":")[1].Split(',')[0] : "",
+                                    str.Contains("flight_icao\":") ? str.Split("flight_icao\":")[1].Split(',')[0] : "", str.Contains("flight_iata\":") ? str.Split("flight_iata\":")[1].Split(',')[0] : "",
+                                    str.Split("dep_icao\":")[1].Split(',')[0], str.Split("dep_iata\":")[1].Split(',')[0], str.Split("arr_icao\":")[1].Split(',')[0], str.Split("arr_iata\":")[1].Split(',')[0],
+                                    str.Split("airline_icao\":")[1].Split(',')[0], str.Split("airline_iata\":")[1].Split(',')[0], str.Split("aircraft_icao\":")[1].Split(',')[0], str.Split("updated\":")[1].Split(',')[0],
+                                    str.Split("status\":")[1].Split(',')[0]));
+                            }
+                        }
+
+                        requestsLeft = int.Parse(firstLine.Split("\"limits_total\":")[1].Substring(0, 3).Replace("}", "").Replace(",", ""));
+
+                        break;
+                }
+            }
+        }
+
+        earthCircumferenceEquator = (long)(earthDiameterEquator * Mathf.PI);
+        earthCircumeferencePoles = (long)(earthDiameterPoles * Mathf.PI);
+
+        completeNavData.UpdateAIRACData(cycleInfoFilePath);
+        airacInfo.text = "AIRAC Cycle: " + completeNavData.airacCycle + "\n" + "Version: " + completeNavData.airacVersion + "\n" + "Valid: " + completeNavData.airacValid;
+    }
+
+    private void FixedUpdate()
+    {
+        coordinateText.text = "(" + a320System.coordinatePosition.latitude.ToString("f5") + "° " + ", " + a320System.coordinatePosition.longitude.ToString("f5") + "°)";
+    }
+
+    private void Update()
+    {
+        localTime.Update();
+        zuluTime.Update();
+
+        timeText.text = zuluTime.GetString() + " Zulu" + "\n" + localTime.GetString() + " UTC+" + utcOffset;
+
+        for (int i = 0; i < audioQueue.Count; i++)
+        {
+            if (audioQueue[i].Update())
+            {
+                audioQueue.RemoveAt(i);
+            }
+        }
+
+        foreach (PlaneTag pt in planeTags)
+        {
+            pt.Update(this, tagsVisible);
+        }
+    }
+
+    public WeatherCondition GetLocalConditions(float altitude, Vector3 coordinates)
+    {
+        WeatherCondition localCondition = new WeatherCondition();
+
+        windVelo.Update();
+        turbulentFlowVelo.Update();
+
+        shiftedWind += (windShift / groundWindScaling) * Time.fixedDeltaTime;
+        shiftedTurbulence += (turbulenceShift / windFlowTurbulenceScaling) * Time.fixedDeltaTime;
+
+
+        //Temperature
+        localCondition.temperatureC = 20 + (altitude / tempLapseAltitudeSpacing * standardTempLapseRate);
+        localCondition.temperatureK = 273.15f + localCondition.temperatureC;
+
+        //Pressure
+        localCondition.absolutePressure_hPa = ((standardPressure_hPa * (1 - (pressureDifferential * (Mathf.PerlinNoise(((1 / pressureScaling) * coordinates.x) + ((1 / pressureScaling) * (pressureUpwardsShift * coordinates.y)), (1 / pressureScaling) * coordinates.z) - (0.5f * (1 / pressureScaling)))))) * hpaToInhg * Mathf.Pow(1 - 6.87535f * Mathf.Pow(10, -6) * altitude, 5.2561f)) / hpaToInhg;
+
+        //Winds
+        turbulentFlowVelo.ValueChange(CurlNoise(turbulentFlowSeed + (coordinates.x + shiftedTurbulence.x) / windFlowTurbulenceScaling, turbulentFlowSeed + (coordinates.z + shiftedTurbulence.z) / windFlowTurbulenceScaling));
+        windVelo.ValueChange(CurlNoise(windSeed + (coordinates.x + shiftedWind.x) / groundWindScaling, windSeed + (coordinates.z + shiftedWind.z) / groundWindScaling));
+        float directionalDifference = Vector2.Angle(turbulentFlowVelo.smoothValue.normalized, windVelo.smoothValue.normalized);
+        localCondition.windVelocity = windVelo.smoothValue - (turbulenceStrength * (Mathf.Pow(Mathf.Clamp01(Mathf.Clamp01((localCondition.windVelocity.magnitude / turbulentFlowVelo.smoothValue.magnitude) - 1) + (directionalDifference / 180)), 1 + (windTurbulentFlowSharpness * 0.7f)) * turbulentFlowVelo.smoothValue));
+        localCondition.cleanWindVelocity = windVelo.smoothValue;
+        localCondition.windDirection = 180f + Vector2.SignedAngle(localCondition.windVelocity.normalized, new Vector2(0, -1));
+        localCondition.cleanWindDirection = 180f + Vector2.SignedAngle(windVelo.smoothValue.normalized, new Vector2(0, -1));
+        localCondition.windSpeed = Mathf.Sqrt(Mathf.Pow(localCondition.windVelocity.x, 2) + Mathf.Pow(localCondition.windVelocity.y, 2));
+        localCondition.cleanWindSpeed = Mathf.Sqrt(Mathf.Pow(windVelo.smoothValue.x, 2) + Mathf.Pow(windVelo.smoothValue.y, 2));
+
+        if(localCondition.cleanWindSpeed < 1)
+        {
+            localCondition.windDescription = WindDescription.Calm;
+        }
+        else if(localCondition.cleanWindSpeed >= 1 && localCondition.cleanWindSpeed < 4)
+        {
+            localCondition.windDescription = WindDescription.LightAir;
+        }
+        else if (localCondition.cleanWindSpeed >= 4 && localCondition.cleanWindSpeed < 7)
+        {
+            localCondition.windDescription = WindDescription.LightBreeze;
+        }
+        else if (localCondition.cleanWindSpeed >= 7 && localCondition.cleanWindSpeed < 11)
+        {
+            localCondition.windDescription = WindDescription.GentleBreeze;
+        }
+        else if (localCondition.cleanWindSpeed >= 11 && localCondition.cleanWindSpeed < 17)
+        {
+            localCondition.windDescription = WindDescription.ModerateBreeze;
+        }
+        else if (localCondition.cleanWindSpeed >= 17 && localCondition.cleanWindSpeed < 22)
+        {
+            localCondition.windDescription = WindDescription.FreshBreeze;
+        }
+        else if (localCondition.cleanWindSpeed >= 22 && localCondition.cleanWindSpeed < 28)
+        {
+            localCondition.windDescription = WindDescription.StrongBreeze;
+        }
+        else if (localCondition.cleanWindSpeed >= 28 && localCondition.cleanWindSpeed < 34)
+        {
+            localCondition.windDescription = WindDescription.NearGale;
+        }
+        else if (localCondition.cleanWindSpeed >= 34 && localCondition.cleanWindSpeed < 41)
+        {
+            localCondition.windDescription = WindDescription.Gale;
+        }
+        else if (localCondition.cleanWindSpeed >= 41 && localCondition.cleanWindSpeed < 48)
+        {
+            localCondition.windDescription = WindDescription.StrongGale;
+        }
+        else if (localCondition.cleanWindSpeed >= 48 && localCondition.cleanWindSpeed < 56)
+        {
+            localCondition.windDescription = WindDescription.Storm;
+        }
+        else if (localCondition.cleanWindSpeed >= 56 && localCondition.cleanWindSpeed <= 63)
+        {
+            localCondition.windDescription = WindDescription.ViolentStorm;
+        }
+        else if (localCondition.cleanWindSpeed > 63)
+        {
+            localCondition.windDescription = WindDescription.Hurricane;
+        }
+
+        //Humidity
+        localCondition.humidity = 60;
+
+        //Air density
+        localCondition.airDensity = (localCondition.absolutePressure_hPa * 100) / ((dryAirSpecificConstant + ((localCondition.humidity * maxHumidityWaterVaporContent / 100) / 100 * (waterVaporSpecificConstant - dryAirSpecificConstant))) * localCondition.temperatureK);
+
+        //Speed of sound
+        localCondition.speedOfSound = Mathf.Sqrt((1.4f * (localCondition.absolutePressure_hPa * 100)) / localCondition.airDensity);
+
+        return localCondition;
+    }
+
+    public float GetSeaLevelPressure(Vector3 coordinates)
+    {
+        return standardPressure_hPa * atmosphericPressureByAltitude.Evaluate(0 / maxAtmosphericAltitude) * (1 - (pressureDifferential * (Mathf.PerlinNoise(((1 / pressureScaling) * coordinates.x) + ((1 / pressureScaling) * (pressureUpwardsShift * coordinates.y)), (1 / pressureScaling) * coordinates.z) - (0.5f * (1 / pressureScaling)))));
+    }
+
+    Vector2 CurlNoise(float x, float y)
+    {
+        var eps = 0.0001f;
+
+        //Find rate of change in X direction
+        float n1 = Noise.Simplex2D(new Vector3(x + eps, y, 0), 5).value;
+        float n2 = Noise.Simplex2D(new Vector3(x - eps, y, 0), 5).value;
+
+        //Average to find approximate derivative
+        float a = (n1 - n2) / (2 * eps);
+
+        //Find rate of change in Y direction
+        n1 = Noise.Simplex2D(new Vector3(x, y + eps, 0), 5).value;
+        n2 = Noise.Simplex2D(new Vector3(x, y - eps, 0), 5).value;
+
+        //Average to find approximate derivative
+        float b = (n1 - n2) / (2 * eps);
+
+        //Curl
+        return new Vector2(b, -a);
+    }
+
+    public void AddAudioToQueue(GameBehaviour reference, AdvancedAudio _audio, float _delay, Vector3 _origin, float _distance, float _strength, float _pitchMultiplier)
+    {
+        audioQueue.Add(new ClipToPlay(reference, _audio, _delay, _origin, _distance, _strength, _pitchMultiplier));
+    }
+
+    public void AddAudioToQueue(GameBehaviour reference, AdvancedAudio _audio, float _delay, Transform _parent, float _distance, float _strength, float _pitchMultiplier)
+    {
+        audioQueue.Add(new ClipToPlay(reference, _audio, _delay, _parent, _distance, _strength, _pitchMultiplier));
+    }
+
+    public void CreateDistanceAudioLoopObject(AdvancedAudio audio, Transform parent, bool vectorFollow)
+    {
+        List<SoundBehaviour> sounds = new List<SoundBehaviour>();
+        for(int i = 0; i < audio.clips.Length; i++)
+        {
+            var ao = Instantiate(audioObject, parent.transform.position, Quaternion.identity);
+            var aos = ao.GetComponent<AudioSource>();
+            var aoss = ao.GetComponent<SoundBehaviour>();
+            aoss.hasParent = true;
+
+            if (vectorFollow)
+            {
+                aoss.followsVector = true;
+            }
+            else
+            {
+                aoss.followsVector = false;
+            }
+
+            aoss.parent = parent;
+            aoss.gb = this;
+            aoss.reference = new AudioRef(audio.maxVolume, audio.MaxDistance(), audio.clips[i].range, audio.clips[i].curve, audio.rolloff, audio.spread, audio.clips[i].volumeMultiplierByAngleCurve, audio.clips[i].directionalAudio, 0, audio.loop);
+            aos.maxDistance = 50000;
+            aos.clip = audio.clips[i].clip;
+            AnimationCurve editedCurve = new AnimationCurve();
+            editedCurve.AddKey(new Keyframe(0, 1));
+            editedCurve.AddKey(new Keyframe(1, 1));
+            aos.SetCustomCurve(AudioSourceCurveType.CustomRolloff, editedCurve);
+
+            aos.loop = true;
+            aos.Play();
+
+            ao.GetComponent<SoundBehaviour>().useIntegratedControl = audio.useIntegratedControl;
+            sounds.Add(aoss);
+        }
+
+        audio.audioSources = sounds.ToArray();
+    }
+
+    public void PlayDistanceAudioOneShot(ClipToPlay audio, Transform parent)
+    {
+        List<SoundBehaviour> sounds = new List<SoundBehaviour>();
+        for (int i = 0; i < audio.audio.clips.Length; i++)
+        {
+            var ao = Instantiate(audioObject, parent.transform.position, Quaternion.identity);
+            var aos = ao.GetComponent<AudioSource>();
+            var aoss = ao.GetComponent<SoundBehaviour>();
+            aoss.hasParent = true;
+            aoss.parent = parent;
+            aoss.gb = this;
+            aoss.reference = new AudioRef(audio.audio.maxVolume, audio.audio.MaxDistance(), audio.audio.clips[i].range, audio.audio.clips[i].curve, audio.audio.rolloff, audio.audio.spread, audio.audio.clips[i].volumeMultiplierByAngleCurve, audio.audio.clips[i].directionalAudio, audio.strength, false);
+            aos.maxDistance = 50000;
+            aos.clip = audio.audio.clips[i].clip;
+            AnimationCurve editedCurve = new AnimationCurve();
+            editedCurve.AddKey(new Keyframe(0, 1));
+            editedCurve.AddKey(new Keyframe(1, 1));
+            aos.SetCustomCurve(AudioSourceCurveType.CustomRolloff, editedCurve);
+
+            aos.loop = false;
+            aos.Play();
+
+            ao.GetComponent<SoundBehaviour>().useIntegratedControl = audio.audio.useIntegratedControl;
+            sounds.Add(aoss);
+        }
+
+        audio.audio.audioSources = sounds.ToArray();
+    }
+
+    public void PlayDistanceAudioOneShot(ClipToPlay audio, Vector3 origin)
+    {
+        List<SoundBehaviour> sounds = new List<SoundBehaviour>();
+        for (int i = 0; i < audio.audio.clips.Length; i++)
+        {
+            var ao = Instantiate(audioObject, origin, Quaternion.identity);
+            var aos = ao.GetComponent<AudioSource>();
+            var aoss = ao.GetComponent<SoundBehaviour>();
+            aoss.hasParent = false;
+            aoss.gb = this;
+            aoss.reference = new AudioRef(audio.audio.maxVolume, audio.audio.MaxDistance(), audio.audio.clips[i].range, audio.audio.clips[i].curve, audio.audio.rolloff, audio.audio.spread, audio.audio.clips[i].volumeMultiplierByAngleCurve, audio.audio.clips[i].directionalAudio, audio.strength, false);
+            aos.maxDistance = 50000;
+            aos.clip = audio.audio.clips[i].clip;
+            AnimationCurve editedCurve = new AnimationCurve();
+            editedCurve.AddKey(new Keyframe(0, 1));
+            editedCurve.AddKey(new Keyframe(1, 1));
+            aos.SetCustomCurve(AudioSourceCurveType.CustomRolloff, editedCurve);
+
+            aos.loop = false;
+            aos.Play();
+
+            ao.GetComponent<SoundBehaviour>().useIntegratedControl = audio.audio.useIntegratedControl;
+            sounds.Add(aoss);
+        }
+
+        audio.audio.audioSources = sounds.ToArray();
+    }
+
+    void ParseFlightSchedules(string text)
+    {
+        string fs = text;
+        string[] fLines = Regex.Split ( fs, "\n|\r|\r\n|]" );
+
+        //flightSchedules = fLines.ToList();
+    }
+
+    public Vector3 CoordinatesToPosition(double lat, double lon)
+    {
+        float zPos = coordinateReferencePoint.transform.position.z + (float)(lat - coordinateReference.latitude) * 110900;
+        float longMetersPerDegree = Mathf.PI / 180 * (6367449 * Mathf.Cos((float)lat * Mathf.Deg2Rad));
+        float xPos = coordinateReferencePoint.transform.position.x + (float)(lon - coordinateReference.longitude) * longMetersPerDegree;
+
+        return new Vector3(xPos, 0, zPos);
+    }
+
+    public float DistanceBetweenCoordinates(Coordinates from, Coordinates to, DistanceUnit unit)
+    {
+        Coordinates fromR = new Coordinates(from.latitude, from.longitude);
+        Coordinates toR = new Coordinates(to.latitude, from.latitude);
+
+        // distance between latitudes and longitudes
+        double dLat = (Math.PI / 180) * (to.latitude - from.latitude);
+        double dLon = (Math.PI / 180) * (to.longitude - from.longitude);
+
+        // convert to radians
+        fromR.latitude = (Math.PI / 180) * (from.latitude);
+        toR.latitude = (Math.PI / 180) * (to.latitude);
+
+        // apply formulae
+        double a = Math.Pow(Math.Sin(dLat / 2), 2) +
+                   Math.Pow(Math.Sin(dLon / 2), 2) *
+                   Math.Cos(fromR.latitude) * Math.Cos(toR.latitude);
+        double rad = 6371;
+        double c = 2 * Math.Asin(Math.Sqrt(a));
+
+        if (unit == DistanceUnit.Meters)
+        {
+            return (float)(rad * c * 1000);
+        }
+        else if (unit == DistanceUnit.NauticalMiles)
+        {
+            return (float)(rad * c * 1000) * metersToNauticalMiles;
+        }
+
+        return 0;
+    }
+
+    public float DirectionBetweenCoordinates(Coordinates from, Coordinates to)
+    {
+        double diff = to.longitude - from.longitude;
+        float x = Mathf.Cos((float)from.latitude) * Mathf.Sin((float)diff);
+        float y = Mathf.Cos((float)to.latitude) * Mathf.Sin((float)from.latitude) - Mathf.Sin((float)to.latitude) * Mathf.Cos((float)from.latitude) * Mathf.Cos((float)diff);
+
+        return Mathf.Atan2(x, y) * -Mathf.Rad2Deg;
+    }
+
+    public class JsonHelper
+    {
+        public static T[] getJsonArray<T>(string json)
+        {
+            string newJson = "{ \"array\": " + json + "}";
+            Wrapper<T> wrapper = JsonUtility.FromJson<Wrapper<T>>(newJson);
+            return wrapper.array;
+        }
+
+        [Serializable]
+        private class Wrapper<T>
+        {
+            public T[] array;
+        }
+    }
+}
