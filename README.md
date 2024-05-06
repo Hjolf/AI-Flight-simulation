@@ -12,4 +12,10 @@ based on If-statements.
 In the future, I plan on implementing a "command queue" for ATC commands, which the AI will prioritize based on events happening
 in the cockpit at that moment. The goal is for the AI to act similar to a human, with reaction time, and decision-making.
 
+The coordinate system is currently calculated from a known "zero-point" in the cartesian coodinate system, as the world is currently flat.
+I've been prototyping a realistic planet simulation which would eliminate the need to calculate things based on fake set values, instead
+giving real geographic coordinates. There are some issues that I've yet to solve. As Unity runs on a 32-bit system, it's bound to run
+into floating point errors at a larger scale. So at the moment I'm trying to keep the "player" perspective at the origin point of the
+coordinate system, moving the world around, and loading only the parts that are needed.
+
 Thank you for taking your interest in my project!
