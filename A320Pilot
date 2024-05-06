@@ -1,0 +1,1625 @@
+using CustomLibrary;
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
+using static GameBehaviour;
+using static A320Systems;
+
+
+public class A320Pilot : MonoBehaviour
+{
+    A320Pilot pilot;
+    A320Systems system;
+    GameBehaviour gb;
+    public RadarController radar;
+    public enum ControlType { AI, Player };
+    public ControlType controlType;
+    public enum FlightPhase { None, Takeoff, Climb, Cruise, Descent, Hold, Approach, Landing, Rollout };
+    public FlightPhase flightPhase;
+    public enum ThrottleSetting { Ground, Flex, TOGA, Climb };
+    public ThrottleSetting throttleSetting;
+    public enum AltitudeControlSetting { SpeedTarget, AccelArrest, AccelRate, AltHold, ClimbRate, AttitudeHold, AltitudeTarget, Ground, FlightPlan, GS, Flare };
+    public AltitudeControlSetting altControl;
+    public enum HeadingControlSetting { HoldLevel, HoldHeading, HoldTrack, FlightPlan, Direct, LOC };
+    public HeadingControlSetting hdgControl;
+
+    public string AIState;
+
+    [Space(10)]
+
+    public bool PIDTuning = false;
+
+    [Header("Controls")]
+    [Range(-1, 1)]
+    public float noseWheelSteering;
+    SmoothFloat AInoseWheelSteering = new SmoothFloat(0, new Vector2(-1, 1), 0.2f);
+    [Range(0, 1)]
+    public float wheelBrake;
+    SmoothFloat AIwheelBrake = new SmoothFloat(0, new Vector2(0, 1), 0.2f);
+    public Throttle throttle;
+    [Range(0.005f, 0.5f)]
+    public float AIInputDelay = 0.02f;
+    SmoothFloat AIelevatorInput = new SmoothFloat(0, new Vector2(-1, 1), 0.02f);
+    SmoothFloat AIRollInput = new SmoothFloat(0, new Vector2(-1, 1), 0.02f);
+    [Range(-1, 1)]
+    public float elevatorInput;
+    [Range(-1, 1)]
+    public float rollInput;
+
+    [Space(10)]
+    public float normalWheelBrakeAmount;
+
+    [Header("Joystick controls")]
+    public JoystickControl joystickNoseWheelSteering;
+    public JoystickControl joystickWheelBrake;
+    public JoystickControl joystickThrottle;
+    public JoystickControl joystickPitch;
+    public JoystickControl joystickRoll;
+
+    public string joystickReverseToggle;
+    public string joystickGearDown;
+    public string joystickGearUp;
+    public string joystickNormalWheelBrake;
+    public string joystickMaxWheelBrake;
+    public string joystickNoseWheelSteeringToggle;
+    public string joystickSpoilersInc;
+    public string joystickSpoilersDec;
+    public string joystickFlapsInc;
+    public string joystickFlapsDec;
+
+    [Header("UI controls")]
+    public Toggle eng1Main;
+    public Toggle eng2Main;
+
+    public Toggle apuStart;
+    public Toggle apuBleed;
+
+    public Toggle batteriesOn;
+
+    public Toggle strobeLight;
+    public Toggle beaconLight;
+    public Toggle wingLight;
+    public Toggle navLogoLight;
+    public Toggle rwyTurnoffLight;
+    public Toggle landLight;
+    public Toggle taxiLight;
+    public Toggle takeoffLight;
+
+    public TMP_Text infoText;
+
+    [Header("AI settings")]
+    public Waypoint startPoint;
+    public List<ReceivedCommand> commandQueue = new();
+    public float avgCommandReplyTime = 0.5f;
+    public List<Waypoint> taxiInstructions;
+    [Range(2, 25)]
+    public float taxiSegmentCorrectionDistance;
+    [Range(2, 100)]
+    public float takeoffRunwayCorrectionDistance;
+    public float taxiSpeedLimit;
+    public float maxTaxiThrottle;
+    public float maxTaxiDeceleration;
+    public float cornerBrakingAnticipation;
+    public float limitingCornerForce;
+    public float cornerBrakingReserve;
+    public float takeoffRunupDelay;
+    public float climbThrottleRate;
+    public float landingThrottleRate;
+    [Range(0, 110)]
+    public float takeoffRunupN1;
+    public float maxTakeoffAngle;
+    public float averageGearupTime;
+    public float takeoffRotationRate;
+    public float climbRotationRate;
+    public float climbAccelRate;
+    public float climbRollRate;
+    public float climbTurnrate;
+    public float climbRollAngle;
+    public float rudderNeutralClimbRate;
+    public float flareDescentRate;
+    public int flareAltitude;
+
+    [Header("AI Flight route following")]
+    public float flightSegmentCorrectionDistance = 250;
+
+    [Header("PID value sets")]
+    public PIDController.DummyPID taxiSteeringPID;
+    public PIDController.DummyPID takeoffSteeringPID;
+    public PIDController.DummyPID wheelBrakePID;
+    public PIDController.DummyPID taxiThrottlePID;
+    public PIDController.DummyPID takeoffThrottlePID;
+    public PIDController.DummyPID takeoffElevatorPID;
+    public PIDController.DummyPID takeoffRollPID;
+    public PIDController.DummyPID climbRollPID;
+    public PIDController.DummyPID climbTurnratePID;
+
+    [Header("PID controllers")]
+    public PIDController climbratePID;
+    public PIDController accelratePID;
+    public PIDController turnratePID;
+    public PIDController rollAnglePID;
+    public PIDController attitudeSpeedPID;
+    public PIDController rollSpeedPID;
+    public PIDController elevatorPID;
+    public PIDController rollPID;
+    public PIDController steeringPID;
+    public PIDController throttlePID;
+    public PIDController brakePID;
+
+    [Header("Stats")]
+    public Waypoint currentTargetPoint;
+    public Waypoint.ConnectedWaypointData currentTurn;
+    public MCDU.FPlanPage.FlightWaypointData currentFlightPoint;
+    public MCDU.FPlanPage.FlightTurnSegment currentFlightSegment;
+    public MCDU.FPlanPage.FlightWaypointData previousFlightPoint;
+    public Vector3 flightTurnTargetPoint;
+    public bool hasTurn;
+    public bool inTurn;
+    public bool hasFlightTurn;
+    public bool inFlightTurn;
+    public Vector3 turnPointTarget;
+    public Waypoint previousPoint;
+    public WaySegment onSegment;
+    public WaySegment nextSegment;
+    public float distanceToWaypoint;
+    public float frontDistanceToWaypoint;
+    public float distanceToFlightWaypoint;
+    public float speedLimitAtTurn;
+    public bool slowingForCorner;
+    public bool turningToRunway;
+    public bool takeoffClearance;
+    public bool takeoffRotate;
+    public bool takeoffAccelArrested;
+    public bool airborne;
+    public bool takeoffReady;
+    public int altControlFPState;
+    public SmoothFloat groundSegmentCorrectionDistance = new SmoothFloat(0, new Vector2(0, 100), 0.8f);
+    public SmoothFloat targetNoseAttitude = new SmoothFloat(0, new Vector2(-45, 45), 0.8f);
+    public SmoothFloat rotationRate = new SmoothFloat(0, new Vector2(-30, 30), 5f);
+    public SmoothFloat rollRate = new SmoothFloat(0, new Vector2(-30, 30), 5f);
+    public SmoothFloat targetClimbRate = new SmoothFloat(0, new Vector2(-5000, 5000), 1f);
+    public SmoothFloat targetHeading = new SmoothFloat(0, new Vector2(0, 360), 1f);
+    public SmoothFloat maxAccelRate = new SmoothFloat(3, new Vector2(0, 10), 1.2f);
+    public SmoothFloat throttleRate = new SmoothFloat(0.1f, new Vector2(0, 10), 1.2f);
+    public float requiredAttitudeSpeed;
+    public float requiredAccelrate;
+    public float requiredClimbrate;
+    public float requiredRollSpeed;
+    public float requiredTurnrate;
+    public float requiredTurnrate2;
+    public float requiredThrottle;
+    public AverageValue requiredThrottleAvg = new AverageValue(0.5f, 30);
+    public bool rudderNeutral;
+    public float lastDescentRate;
+    public bool initialGroundHit = false;
+
+    float decel;
+    float angle;
+    float flightAngle;
+    float angleToWaypoint;
+    float takeoffRunupTimer;
+    float gearupTimer;
+    bool gearupTimerRunning;
+
+    float climbThrottle;
+    float groundRudderControl = 1;
+
+    float lastElevatorInput;
+
+    [Range(0, 360)]
+    public float startDir;
+    [Range(0, 360)]
+    public float endDir;
+
+
+    [Serializable]
+    public class ReceivedCommand
+    {
+        public RadarController.FullCommand fullCommand;
+
+        float commandTimer;
+
+
+        public ReceivedCommand(RadarController.FullCommand _fullCommand, float _avgReplyTime)
+        {
+            fullCommand = _fullCommand;
+            commandTimer = UnityEngine.Random.Range(_avgReplyTime * 0.6f, _avgReplyTime * 1.4f);
+        }
+
+        public bool CanReplyToCommand()
+        {
+            if(commandTimer <= 0)
+            {
+                return true;
+            }
+            else
+            {
+                commandTimer -= Time.deltaTime;
+                return false;
+            }
+        }
+    }
+
+    [Serializable]
+    public struct JoystickControl
+    {
+        public string name;
+        public Vector2 limits;
+        public float center;
+
+        [Header("Stats")]
+        public float returnValue;
+
+
+        public float Update()
+        {
+            returnValue = center + Input.GetAxis(name);
+            return Mathf.Clamp(returnValue, limits.x, limits.y);
+        }
+    }
+
+    [Serializable]
+    public class Throttle
+    {
+        [Range(0, 1)]
+        public float throttleInput;
+
+        public float[] detents;
+        public float detentScale;
+        public float reverseDetent;
+
+
+        [Header("Stats")]
+        public float realThrottle;
+        public bool inReverse;
+        public float reverse;
+        public int currentDetent;
+
+
+        public void Init()
+        {
+            throttleInput = detents[0];
+        }
+
+        public void Update()
+        {
+            currentDetent = -1;
+            realThrottle = throttleInput;
+
+            for(int i = 0; i < detents.Length; i++)
+            {
+                if(throttleInput > detents[i] - detentScale && throttleInput < detents[i] + detentScale)
+                {
+                    realThrottle = detents[i];
+                    currentDetent = i;
+                }
+            }
+
+            if(realThrottle <= reverseDetent)
+            {
+                reverse = 1 - (realThrottle / reverseDetent);
+            }
+            else
+            {
+                reverse = 0;
+            }
+        }
+
+        public int ThrottleDetent()
+        {
+            return currentDetent;
+        }
+
+        public void SetThrottle(float value)
+        {
+            if (!inReverse)
+            {
+                throttleInput = detents[0] + (value * (1 - detents[0]));
+            }
+            else
+            {
+                throttleInput = reverseDetent - (value * reverseDetent);
+            }
+        }
+
+        public void SetThrottleRate(float value, float upperLimit)
+        {
+            if (!inReverse)
+            {
+                throttleInput += value * Time.fixedDeltaTime;
+                throttleInput = Mathf.Clamp(throttleInput, detents[0], upperLimit);
+            }
+            else
+            {
+                throttleInput = reverseDetent - (value * reverseDetent);
+            }
+        }
+
+        public void ToggleReverse()
+        {
+            if (inReverse)
+            {
+                inReverse = false;
+                throttleInput = detents[0];
+            }
+            else
+            {
+                inReverse = true;
+                throttleInput = reverseDetent;
+            }
+        }
+
+        public float ThrottlePosition()
+        {
+            return realThrottle;
+        }
+    }
+
+
+    private void Awake()
+    {
+        pilot = GetComponent<A320Pilot>();
+        system = GetComponent<A320Systems>();
+    }
+    
+    private void Start()
+    {
+        gb = GameObject.Find("GameBehaviour").GetComponent<GameBehaviour>();
+        throttle.Init();
+
+        system.LightSwitch(true, A320Systems.LightType.Nav);
+
+        if (startPoint != null)
+        {
+            taxiInstructions = new();
+
+            if(startPoint.pointType == Waypoint.PointType.Runway)
+            {
+                if(startPoint.touchdownPoint != Vector3.zero)
+                {
+                    transform.position = new Vector3(startPoint.touchdownPoint.x, startPoint.transform.position.y + 4.5f, startPoint.touchdownPoint.z);
+                }
+                else
+                {
+                    transform.position = new Vector3(startPoint.transform.position.x, startPoint.transform.position.y + 4.5f, startPoint.transform.position.z);
+                }
+
+                transform.LookAt(startPoint.runwayOppositeEnd.transform);
+                transform.localEulerAngles = new Vector3(0, transform.localEulerAngles.y, 0);
+
+                previousPoint = startPoint;
+
+                system.altimeterSetting = (int)gb.GetLocalConditions(0, transform.position).absolutePressure_hPa;
+
+                system.autopilot.heading = startPoint.runwayNumber * 10;
+            }
+            else if(startPoint.pointType == Waypoint.PointType.Parking)
+            {
+                transform.position = new Vector3(startPoint.transform.position.x, startPoint.transform.position.y + 4.5f, startPoint.transform.position.z) + startPoint.parkingDirection * Vector3.Distance(system.posPoints.Find("front_limit").transform.position, transform.position);
+                transform.LookAt(startPoint.transform);
+                transform.localEulerAngles = new Vector3(0, transform.localEulerAngles.y, 0);
+            }
+        }
+
+        groundSegmentCorrectionDistance.ValueChange(taxiSegmentCorrectionDistance);
+
+        hasTurn = false;
+        currentTurn = null;
+
+        AIState = "Standby";
+        flightPhase = FlightPhase.None;
+        throttleSetting = ThrottleSetting.Ground;
+
+        AIelevatorInput.smoothing = AIInputDelay;
+        AIRollInput.smoothing = AIInputDelay;
+
+        elevatorPID.SetValues(takeoffElevatorPID);
+        rollPID.SetValues(takeoffRollPID);
+        steeringPID.SetValues(taxiSteeringPID);
+        //throttlePID.SetValues(taxiThrottlePID);
+        brakePID.SetValues(wheelBrakePID);
+
+        system.autopilot.altitude = 3000;
+
+        altControl = AltitudeControlSetting.Ground;
+
+        if (PIDTuning)
+        {
+            AIState = "PID Tuning";
+            radar.ForceFollowAircraft();
+
+            system.SetGearState(false);
+
+            rotationRate.ValueChange(climbRotationRate);
+            targetClimbRate.ValueChange(1000);
+
+            rollPID.SetValues(climbRollPID);
+            turnratePID.SetValues(climbTurnratePID);
+
+            system.SetSteeringMode(SteerMode.Stabilizer);
+            groundSegmentCorrectionDistance.ValueChange(takeoffRunwayCorrectionDistance);
+
+            altControl = AltitudeControlSetting.AltitudeTarget;
+
+            targetNoseAttitude.ValueChange(maxTakeoffAngle);
+
+            steeringPID.SetValues(takeoffSteeringPID);
+
+            airborne = true;
+            takeoffRotate = true;
+
+            system.autopilot.altitude = 3000;
+            system.autopilot.speed = 150;
+
+            transform.position = new Vector3(1918.30652f, 3000 / metersToFeet, 45.5101624f);
+            Vector3 velocityDirection = (system.mCDU.planPage.waypointsToFollowCached[0].point.position - transform.position).normalized;
+            velocityDirection.y = 0;
+            transform.LookAt(system.mCDU.planPage.waypoints[0].waypoint.position);
+            gameObject.GetComponent<Rigidbody>().AddForce(velocityDirection * 200000000);
+            gameObject.GetComponent<Rigidbody>().angularVelocity = Vector3.zero;
+        }
+    }
+
+    private void FixedUpdate()
+    {
+        throttle.Update();
+
+        AInoseWheelSteering.Update(SmoothFloat.UpdateType.FixedUpdate);
+        AIwheelBrake.Update(SmoothFloat.UpdateType.FixedUpdate);
+        AIelevatorInput.Update(SmoothFloat.UpdateType.FixedUpdate);
+        AIRollInput.Update(SmoothFloat.UpdateType.FixedUpdate);
+
+        rotationRate.Update(SmoothFloat.UpdateType.FixedUpdate);
+        rollRate.Update(SmoothFloat.UpdateType.FixedUpdate);
+        maxAccelRate.Update(SmoothFloat.UpdateType.FixedUpdate);
+
+        targetClimbRate.Update(SmoothFloat.UpdateType.FixedUpdate);
+
+        throttleRate.Update(SmoothFloat.UpdateType.FixedUpdate);
+
+        if (controlType == ControlType.Player)
+        {
+            throttle.SetThrottle(joystickThrottle.Update());
+            noseWheelSteering = joystickNoseWheelSteering.Update();
+            system.AileronRollInput(joystickRoll.Update());
+            system.AileronPitchInput(joystickPitch.Update());
+        }
+        else if(controlType == ControlType.AI)
+        {
+            if (taxiInstructions.Count > 0)
+            {
+                if (currentTargetPoint != taxiInstructions[0])
+                {
+                    if (taxiInstructions[0].pointType == Waypoint.PointType.Runway)
+                    {
+                        currentTargetPoint = taxiInstructions[0];
+                        AIState = "Taxiing on taxiway " + ClosestSegment().segment.designation;
+
+                        if (!hasTurn)
+                        {
+                            if (currentTargetPoint.segmentsByAngle.Count > 0)
+                            {
+                                currentTurn = currentTargetPoint.CheckForTurn(currentTargetPoint.runwayOppositeEnd, ClosestSegment().segment);
+                            }
+
+                            if (currentTurn != null)
+                            {
+                                hasTurn = true;
+                                if (turnPointTarget != currentTurn.turnEntryPoints[0].point)
+                                {
+                                    turnPointTarget = currentTurn.turnEntryPoints[0].point;
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        currentTargetPoint = taxiInstructions[0];
+                        AIState = "Taxiing on taxiway " + ClosestSegment().segment.designation;
+                    }
+
+                    if (taxiInstructions.Count > 1)
+                    {
+                        if (!hasTurn)
+                        {
+                            if (currentTargetPoint.segmentsByAngle.Count > 0)
+                            {
+                                currentTurn = currentTargetPoint.CheckForTurn(taxiInstructions[1], ClosestSegment().segment);
+                            }
+
+                            if (currentTurn != null)
+                            {
+                                hasTurn = true;
+                                if (turnPointTarget != currentTurn.turnEntryPoints[0].point)
+                                {
+                                    turnPointTarget = currentTurn.turnEntryPoints[0].point;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                if(previousPoint != null)
+                {
+                    if (previousPoint.pointType == Waypoint.PointType.Runway && currentTargetPoint != previousPoint.runwayOppositeEnd)
+                    {
+                        currentTargetPoint = previousPoint.runwayOppositeEnd;
+
+                        if(flightPhase == FlightPhase.None)
+                        {
+                            if (takeoffClearance && flightPhase != FlightPhase.Takeoff)
+                            {
+                                AIState = "Taking off on runway " + currentTargetPoint.runwayOppositeEnd.designation;
+                                flightPhase = FlightPhase.Takeoff;
+                            }
+                            else
+                            {
+                                AIState = "Lined up on runway " + currentTargetPoint.runwayOppositeEnd.designation;
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    currentTargetPoint = null;
+                }
+            }
+
+            if (currentTargetPoint != null)
+            {
+                Vector3 segmentDirection = Vector3.zero;
+                if (currentTargetPoint.segmentsByAngle.Count > 0)
+                {
+                    onSegment = ClosestSegment().segment;
+                    segmentDirection = ClosestSegment().direction;
+                }
+
+                Vector3 nearestPoint;
+                Vector2 targetPointV2;
+                Vector3 correctedPoint;
+                Vector3 circlePointOnTurn = Vector3.zero;
+
+                if (turnPointTarget == Vector3.zero)
+                {
+                    nearestPoint = NearestPointOnLine(currentTargetPoint.transform.position, segmentDirection, system.pivotPoint.transform.position);
+                    targetPointV2 = new Vector2(currentTargetPoint.transform.position.x, currentTargetPoint.transform.position.z);
+
+                    correctedPoint = nearestPoint + segmentDirection * -groundSegmentCorrectionDistance.smoothValue;
+                }
+                else
+                {
+                    circlePointOnTurn = ClosestPointOnCircle(currentTurn.turnCenter, currentTurn.turnRadius, system.pivotPoint.transform.position, currentTargetPoint.GetTurnSigned(currentTurn) * groundSegmentCorrectionDistance.smoothValue);
+
+                    if (!inTurn)
+                    {
+                        nearestPoint = NearestPointOnLine(turnPointTarget, segmentDirection, system.pivotPoint.transform.position);
+                        targetPointV2 = new Vector2(turnPointTarget.x, turnPointTarget.z);
+
+                        correctedPoint = nearestPoint + segmentDirection * -groundSegmentCorrectionDistance.smoothValue;
+                    }
+                    else
+                    {
+                        nearestPoint = ClosestPointOnCircle(currentTurn.turnCenter, currentTurn.turnRadius, system.pivotPoint.transform.position, currentTargetPoint.GetTurnSigned(currentTurn) * groundSegmentCorrectionDistance.smoothValue);
+                        targetPointV2 = new Vector2(turnPointTarget.x, turnPointTarget.z);
+
+                        correctedPoint = nearestPoint;
+                    }
+                }
+
+                Debug.DrawLine(system.pivotPoint.transform.position, correctedPoint);
+                distanceToWaypoint = Vector2.Distance(system.pivotPointV2, targetPointV2);
+                frontDistanceToWaypoint = Vector2.Distance(system.frontPointV2, targetPointV2);
+
+                if (!hasTurn)
+                {
+                    if (distanceToWaypoint < groundSegmentCorrectionDistance.smoothValue)
+                    {
+                        if (taxiInstructions.Count > 0)
+                        {
+                            if (taxiInstructions[0].pointType == Waypoint.PointType.HoldShort)
+                            {
+                                system.LightSwitch(true, A320Systems.LightType.Strobe);
+                            }
+
+                            previousPoint = taxiInstructions[0];
+                            taxiInstructions.RemoveAt(0);
+                        }
+                    }
+
+                    decel = Mathf.Clamp(system.groundSpeed - taxiSpeedLimit, 0, maxTaxiDeceleration);
+                    speedLimitAtTurn = taxiSpeedLimit;
+                    slowingForCorner = false;
+                }
+                else
+                {
+                    int signedDirection = SignedDirection(Mathf.PI + currentTurn.turnEntryPoints[0].angle, PointAngle(currentTurn.turnCenter, circlePointOnTurn));
+
+                    if (!inTurn)
+                    {
+                        float requiredStoppingDistance = Mathf.Abs(((system.groundSpeed * 0.5144444f) - speedLimitAtTurn) / (maxTaxiDeceleration * 0.5144444f) * (system.groundSpeed * 0.5144444f));
+
+                        if (frontDistanceToWaypoint <= requiredStoppingDistance + cornerBrakingReserve)
+                        {
+                            slowingForCorner = true;
+                        }
+
+                        if (!slowingForCorner)
+                        {
+                            speedLimitAtTurn = taxiSpeedLimit;
+                            decel = Mathf.Clamp(system.groundSpeed - taxiSpeedLimit, 0, maxTaxiDeceleration);
+                        }
+                        else
+                        {
+                            speedLimitAtTurn = Mathf.Clamp(Mathf.Sqrt(limitingCornerForce * currentTurn.turnRadius / system.GetCurrentAircraftWeight()), (1 - Mathf.Clamp01(Mathf.Pow(Mathf.Abs(currentTurn.turnSweepAngle) / (Mathf.PI / 4), 1.7f))) * taxiSpeedLimit, taxiSpeedLimit);
+                            decel = Mathf.Clamp((system.groundSpeed / Mathf.Clamp(Mathf.Pow(frontDistanceToWaypoint, 0.8f) - cornerBrakingAnticipation, 5, Mathf.Infinity)) * ((system.groundSpeed - speedLimitAtTurn) / 2), 0, maxTaxiDeceleration);
+                        }
+                    }
+                    else
+                    {
+                        slowingForCorner = false;
+                        speedLimitAtTurn = Mathf.Clamp(Mathf.Sqrt(limitingCornerForce * currentTurn.turnRadius / system.GetCurrentAircraftWeight()), (1 - Mathf.Clamp01(Mathf.Pow(Mathf.Abs(currentTurn.turnSweepAngle) / (Mathf.PI / 2), 1.7f))) * taxiSpeedLimit, taxiSpeedLimit);
+                        decel = Mathf.Clamp(system.groundSpeed - speedLimitAtTurn, 0, maxTaxiDeceleration);
+                    }
+
+                    if (signedDirection == currentTargetPoint.GetTurnSigned(currentTurn))
+                    {
+                        if (!inTurn)
+                        {
+                            inTurn = true;
+                            turnPointTarget = currentTurn.turnEntryPoints[1].point;
+
+                            if (currentTargetPoint.pointType == Waypoint.PointType.Runway)
+                            {
+                                turningToRunway = true;
+                                AIState = "Turning to runway " + currentTargetPoint.designation;
+
+                                if (takeoffClearance)
+                                {
+                                    system.LightSwitch(true, A320Systems.LightType.Land);
+                                    system.LightSwitch(true, A320Systems.LightType.Takeoff);
+                                    system.LightSwitch(true, A320Systems.LightType.Turnoff);
+                                }
+
+                                targetHeading.ValueChange(currentTargetPoint.runwayNumber * 10);
+                            }
+                        }
+                    }
+
+                    if (distanceToWaypoint < groundSegmentCorrectionDistance.smoothValue && inTurn)
+                    {
+                        if (taxiInstructions.Count > 0)
+                        {
+                            if (taxiInstructions[0].pointType == Waypoint.PointType.HoldShort)
+                            {
+                                system.LightSwitch(true, A320Systems.LightType.Strobe);
+                            }
+
+                            previousPoint = taxiInstructions[0];
+                            taxiInstructions.RemoveAt(0);
+                            currentTurn = null;
+                            hasTurn = false;
+                            inTurn = false;
+                            turningToRunway = false;
+                            slowingForCorner = false;
+                            turnPointTarget = Vector3.zero;
+                        }
+                    }
+                }
+
+                Vector2 pointV = new Vector2(correctedPoint.x, correctedPoint.z);
+                angle = Vector2.SignedAngle(new Vector2(transform.forward.x, transform.forward.z), (pointV - system.pivotPointV2).normalized);
+                angleToWaypoint = Vector2.Angle(new Vector2(transform.forward.x, transform.forward.z), (new Vector2(currentTargetPoint.transform.position.x, currentTargetPoint.transform.position.z) - pointV).normalized);
+
+                if (flightPhase == FlightPhase.None)
+                {
+                    AIwheelBrake.ValueChange(Mathf.Clamp01(brakePID.GetThrustFactorFixed(decel + Mathf.Clamp(system.forwardAcceleration, -Mathf.Infinity, 0))));
+                    throttle.SetThrottle(Mathf.Clamp(throttlePID.GetThrustFactorFixed((Mathf.Min(taxiSpeedLimit, speedLimitAtTurn) - 2) - system.groundSpeed), 0, maxTaxiThrottle));
+                }
+            }
+
+            if (flightPhase == FlightPhase.Takeoff)
+            {
+                //throttlePID.SetValues(takeoffThrottlePID);
+                throttleRate.ValueChange(climbThrottleRate);
+
+                if (Mathf.Abs(angle) <= 0.03f && system.steerMode != SteerMode.Stabilizer)
+                {
+                    system.SetSteeringMode(SteerMode.Stabilizer);
+                    groundSegmentCorrectionDistance.ValueChange(takeoffRunwayCorrectionDistance);
+                    system.verticalStabilizer.ResetToAutomatic();
+
+                    targetNoseAttitude.ValueChange(maxTakeoffAngle);
+
+                    takeoffRunupTimer = UnityEngine.Random.Range(takeoffRunupDelay * 0.8f, takeoffRunupDelay * 1.2f);
+                    elevatorInput = -0.5f;
+
+                    steeringPID.SetValues(takeoffSteeringPID);
+
+                    hdgControl = HeadingControlSetting.HoldHeading;
+
+                    takeoffReady = true;
+
+                    if (altControl != AltitudeControlSetting.Ground)
+                    {
+                        altControl = AltitudeControlSetting.Ground;
+                    }
+                }
+
+                if (takeoffReady)
+                {
+                    takeoffRunupTimer -= Time.fixedDeltaTime;
+                }
+
+                // REPLACE TRUE AIRSPEED WITH INDICATED AIRSPEED ---------------------------------------------------------------------------------------
+
+                // Takeoff rotation
+                if (system.indicatedAirspeedAverage >= system.mCDU.perfPage.takeoff.vrSpeed)
+                {
+                    if (!takeoffRotate && !airborne)
+                    {
+                        rotationRate.ValueChange(takeoffRotationRate);
+                        rollRate.ValueChange(climbRollRate);
+                        airborne = true;
+                        takeoffRotate = true;
+                    }
+
+                    if (system.indicatedAirspeedAverage >= system.autopilot.speed - 5 && altControl != AltitudeControlSetting.AccelArrest && !takeoffRotate)
+                    {
+                        altControl = AltitudeControlSetting.AccelArrest;
+                        system.autopilot.speed = 150;
+                        previousPoint = null;
+                    }
+
+                    if (!system.onGround && hdgControl != HeadingControlSetting.FlightPlan)
+                    {
+                        Debug.Log("Set hdg control to flightplan");
+                        system.autopilot.FlyFlightPlan();
+                        rollPID.SetValues(climbRollPID);
+                        turnratePID.SetValues(climbTurnratePID);
+                    }
+                }
+
+                if(system.indicatedAirspeedAverage >= 80 && system.indicatedAirspeedAverage <= 100)
+                {
+                    elevatorInput = Mathf.Clamp((system.indicatedAirspeedAverage - 100) / 40, -0.5f, 0);
+                }
+
+                if (takeoffRunupTimer < 0)
+                {
+                    throttleSetting = ThrottleSetting.TOGA;
+                    // CHANGE TO FLEX / TOGA LATER ---------------------------------------------------------------------------------------------------------------
+                    throttle.SetThrottle(1);
+
+                    system.autopilot.speed = system.mCDU.perfPage.takeoff.v2Speed + 15;
+
+                    takeoffRunupTimer = 0;
+                    takeoffReady = false;
+                }
+                else if(takeoffRunupTimer > 0)
+                {
+                    throttle.SetThrottle(Mathf.Clamp01(throttlePID.GetThrustFactorFixed(takeoffRunupN1 - system.engines[0].N1rpmPercent)));
+                }
+
+                if (system.indicatedAltitude >= system.mCDU.perfPage.takeoff.thrustRedAlt && throttleSetting != ThrottleSetting.Climb && flightPhase != FlightPhase.Climb)
+                {
+                    throttleSetting = ThrottleSetting.Climb;
+                    flightPhase = FlightPhase.Climb;
+                    climbThrottle = throttle.realThrottle * 0.88f;
+                    throttle.SetThrottle(throttle.realThrottle * 0.88f);
+
+                    if (system.autopilot.speed != 150)
+                    {
+                        system.autopilot.speed = 150;
+                    }
+                }
+            }
+            else if (flightPhase == FlightPhase.Climb)
+            {
+                if (system.indicatedAltitude >= system.mCDU.perfPage.takeoff.accAlt * 0.5f && rotationRate.GetValue() != climbRotationRate)
+                {
+                    rotationRate.ValueChange(climbRotationRate);
+                    targetClimbRate.ValueChange(1000);
+                }
+
+                if (system.indicatedAltitude >= system.mCDU.perfPage.takeoff.accAlt && system.indicatedAltitude < system.mCDU.perfPage.takeoff.accAlt + 1000 && system.indicatedAirspeedAverage < 230 && altControl != AltitudeControlSetting.FlightPlan)
+                {
+                    altControl = AltitudeControlSetting.FlightPlan;
+                }
+
+                if(system.indicatedAltitude >= 10000)
+                {
+                    if (system.landLightOn)
+                    {
+                        system.LightSwitch(false, A320Systems.LightType.Land);
+                    }
+
+                    maxAccelRate.ValueChange(1.5f);
+                    system.autopilot.SetCruiseSpeed();
+                }
+
+                if (system.indicatedAltitude >= system.mCDU.perfPage.takeoff.transAlt && system.altimeterMode != AltimeterSetting.Standard)
+                {
+                    system.altimeterMode = AltimeterSetting.Standard;
+                }
+
+                if (system.indicatedAltitude >= system.mCDU.initPage.cruiseFL * 95)
+                {
+                    flightPhase = FlightPhase.Cruise;
+                    system.autopilot.ApproachActive(true);
+                }
+            }
+            else if(flightPhase == FlightPhase.Cruise)
+            {
+                if(system.autopilot.localizerCaptured || system.autopilot.glideslopeCaptured)
+                {
+                    flightPhase = FlightPhase.Approach;
+                }
+            }
+            else if(flightPhase == FlightPhase.Descent)
+            {
+                if (system.autopilot.localizerCaptured || system.autopilot.glideslopeCaptured)
+                {
+                    flightPhase = FlightPhase.Approach;
+                }
+            }
+            else if(flightPhase == FlightPhase.Approach)
+            {
+                if(system.mCDU.planPage.arrivalRunway.DistanceToTouchdown() < 7)
+                {
+                    system.SetGearState(true);
+                }
+
+                if(system.radioAltimeter < system.mCDU.perfPage.approach.GetDecisionAltitude() && system.radioAltimeter != 0)
+                {
+                    flightPhase = FlightPhase.Landing;
+                }
+            }
+            else if(flightPhase == FlightPhase.Landing)
+            {
+                if(system.radioAltimeter <= flareAltitude && altControl != AltitudeControlSetting.Flare)
+                {
+                    altControl = AltitudeControlSetting.Flare;
+                    lastDescentRate = system.rateOfClimb;
+                    rotationRate.ValueChange(takeoffRotationRate);
+                    previousPoint = system.mCDU.planPage.arrivalRunwayWaypoint;
+                    rudderNeutral = false;
+                }
+
+                if(system.radioAltimeter <= flareAltitude * 0.7f && !initialGroundHit)
+                {
+                    throttle.SetThrottle(throttle.detents[0]);
+                }
+
+                if (system.onGround && !initialGroundHit)
+                {
+                    initialGroundHit = true;
+
+                    hdgControl = HeadingControlSetting.HoldLevel;
+                    targetNoseAttitude.ValueChange(0);
+
+                    throttle.ToggleReverse();
+                    throttle.SetThrottle(1);
+                }
+
+                if (system.frontOnGround)
+                {
+                    AIwheelBrake.ValueChange(0.45f);
+                }
+            }
+
+            if (flightPhase != FlightPhase.None)
+            {
+                if (altControl == AltitudeControlSetting.AccelArrest)
+                {
+                    //requiredRotSpeed.ValueChange(Mathf.Sign(system.forwardAcceleration) * (Mathf.Clamp01(Mathf.Pow(Mathf.Abs(system.forwardAcceleration), 1.7f)) * rotationRate.smoothValue));
+                    requiredAttitudeSpeed = Mathf.Clamp(attitudeSpeedPID.GetThrustFactorFixed(system.forwardAcceleration - 0.5f), -rotationRate.smoothValue, rotationRate.smoothValue);
+                }
+                else if (altControl == AltitudeControlSetting.SpeedTarget)
+                {
+                    float reqClimbrate = 0;
+                    if(system.autopilot.altitude != 0)
+                    {
+                        reqClimbrate = Mathf.Clamp(climbratePID.GetThrustFactorFixed(system.autopilot.altitude - system.indicatedAltitude), -8000, 8000);
+                    }
+
+                    requiredAccelrate = Mathf.Clamp(accelratePID.GetThrustFactorFixed(system.autopilot.speed - system.indicatedAirspeedAverage), -maxAccelRate.smoothValue, maxAccelRate.smoothValue);
+                    requiredAttitudeSpeed = Mathf.Clamp(-attitudeSpeedPID.GetThrustFactorFixed(requiredAccelrate - system.forwardAcceleration), -rotationRate.smoothValue, rotationRate.smoothValue);
+
+                    requiredThrottle = Mathf.Clamp(throttlePID.GetThrustFactorFixed(system.autopilot.speed - system.indicatedAirspeedAverage), throttle.detents[0], climbThrottle);
+                    requiredThrottleAvg.Update(requiredThrottle);
+
+                    if (reqClimbrate < system.rateOfClimb && system.autopilot.altitude != 0)
+                    {
+                        altControl = AltitudeControlSetting.AltitudeTarget;
+                    }
+                }
+                else if (altControl == AltitudeControlSetting.AccelRate)
+                {
+                    requiredAttitudeSpeed = -Mathf.Sign(climbAccelRate - system.forwardAcceleration) * (Mathf.Clamp01(Mathf.Pow(Mathf.Abs(climbAccelRate - system.forwardAcceleration), 1.7f)) * rotationRate.smoothValue);
+                }
+                else if (altControl == AltitudeControlSetting.AttitudeHold)
+                {
+                    requiredAttitudeSpeed = Mathf.Clamp(attitudeSpeedPID.GetThrustFactorFixed(targetNoseAttitude.smoothValue - system.noseAttitude), -rotationRate.smoothValue, rotationRate.smoothValue);
+                }
+                else if (altControl == AltitudeControlSetting.ClimbRate)
+                {
+                    requiredAttitudeSpeed = Mathf.Clamp(attitudeSpeedPID.GetThrustFactorFixed((targetClimbRate.smoothValue - system.rateOfClimb) / 250), -rotationRate.smoothValue, rotationRate.smoothValue);
+                }
+                else if (altControl == AltitudeControlSetting.AltitudeTarget)
+                {
+                    requiredThrottle = Mathf.Clamp(throttlePID.GetThrustFactorFixed(system.autopilot.speed - system.indicatedAirspeedAverage), throttle.detents[0], climbThrottle);
+                    throttle.SetThrottle(requiredThrottleAvg.Update(requiredThrottle));
+                    requiredClimbrate = Mathf.Clamp(climbratePID.GetThrustFactorFixed(system.autopilot.altitude - system.indicatedAltitude), -8000, 8000);
+                    requiredAttitudeSpeed = Mathf.Clamp(attitudeSpeedPID.GetThrustFactorFixed((requiredClimbrate - system.rateOfClimb) / 500), -rotationRate.smoothValue, rotationRate.smoothValue);
+                }
+                else if (altControl == AltitudeControlSetting.FlightPlan)
+                {
+                    //float distance = 
+                    //Debug.Log("Distance to required descend point: " + );
+
+                    if(currentFlightPoint.waypoint.speed == 0 && currentFlightPoint.waypoint.altitude == 0)
+                    {
+                        requiredThrottle = Mathf.Clamp(throttlePID.GetThrustFactorFixed(system.autopilot.speed - system.indicatedAirspeedAverage), throttle.detents[0], climbThrottle);
+                        throttle.SetThrottle(requiredThrottleAvg.Update(requiredThrottle));
+                        requiredClimbrate = Mathf.Clamp(climbratePID.GetThrustFactorFixed(system.autopilot.altitude - system.indicatedAltitude), -3500, 8000);
+                        requiredAttitudeSpeed = Mathf.Clamp(attitudeSpeedPID.GetThrustFactorFixed((requiredClimbrate - system.rateOfClimb) / 500), -rotationRate.smoothValue, rotationRate.smoothValue);
+                    }
+                }
+                else if (altControl == AltitudeControlSetting.GS)
+                {
+                    requiredThrottle = Mathf.Clamp(throttlePID.GetThrustFactorFixed(system.autopilot.speed - system.indicatedAirspeedAverage), throttle.detents[0], climbThrottle);
+                    throttle.SetThrottle(requiredThrottleAvg.Update(requiredThrottle));
+                    requiredClimbrate = Mathf.Clamp(climbratePID.GetThrustFactorFixed(system.mCDU.planPage.arrivalRunway.GetGlideslopeAltitude() - system.indicatedAltitude), -3500, 8000);
+                    requiredAttitudeSpeed = Mathf.Clamp(attitudeSpeedPID.GetThrustFactorFixed((requiredClimbrate - system.rateOfClimb) / 500), -rotationRate.smoothValue, rotationRate.smoothValue);
+                }
+                else if (altControl == AltitudeControlSetting.Flare)
+                {
+                    targetClimbRate.ValueChange(flareDescentRate + Mathf.Pow(Mathf.Clamp(system.radioAltimeter, 10, 2500) / flareAltitude, 1) * (lastDescentRate - flareDescentRate));
+
+                    if (system.onGround)
+                    {
+                        requiredAttitudeSpeed = Mathf.Clamp(attitudeSpeedPID.GetThrustFactorFixed(targetNoseAttitude.smoothValue - system.noseAttitude), -rotationRate.smoothValue, rotationRate.smoothValue);
+                    }
+                    else
+                    {
+                        targetNoseAttitude.ValueChange(system.noseAttitude);
+                        requiredAttitudeSpeed = Mathf.Clamp(attitudeSpeedPID.GetThrustFactorFixed((targetClimbRate.smoothValue - system.rateOfClimb) / 250), -rotationRate.smoothValue, rotationRate.smoothValue);
+                    }
+                }
+
+
+                if (hdgControl == HeadingControlSetting.HoldLevel)
+                {
+                    requiredRollSpeed = Mathf.Clamp(rollSpeedPID.GetThrustFactorFixed(-system.rollAngle), (1 - (Mathf.Clamp01(1 - Mathf.Sign(system.turnrate)) * Mathf.Pow(Mathf.Abs(system.rollAngle) / climbRollAngle, 3))) * -rollRate.smoothValue, (1 - (Mathf.Clamp01(1 - Mathf.Sign(-system.turnrate)) * Mathf.Pow(Mathf.Abs(system.rollAngle) / climbRollAngle, 3))) * rollRate.smoothValue);
+                }
+                else if (hdgControl == HeadingControlSetting.HoldHeading)
+                {
+                    requiredTurnrate = Mathf.Clamp(turnratePID.GetThrustFactorFixed(ShortestAngle(system.track, system.autopilot.heading * Mathf.Deg2Rad)), -climbTurnrate, climbTurnrate);
+                    requiredRollSpeed = Mathf.Clamp(rollSpeedPID.GetThrustFactorFixed(requiredTurnrate - system.turnrate), (1 - (Mathf.Clamp01(1 - Mathf.Sign(system.turnrate)) * Mathf.Pow(Mathf.Abs(system.rollAngle) / climbRollAngle, 3))) * -rollRate.smoothValue, (1 - (Mathf.Clamp01(1 - Mathf.Sign(-system.turnrate)) * Mathf.Pow(Mathf.Abs(system.rollAngle) / climbRollAngle, 3))) * rollRate.smoothValue);
+                }
+                else if (hdgControl == HeadingControlSetting.HoldTrack)
+                {
+
+                }
+                else if (hdgControl == HeadingControlSetting.Direct)
+                {
+                    Vector2 waypointPos = new Vector2(system.autopilot.waypointDirect.gameObject.transform.position.x, system.autopilot.waypointDirect.gameObject.transform.position.z);
+                    float angleToWaypoint = Vector2.SignedAngle(new Vector2(transform.forward.x, transform.forward.z), (waypointPos - system.pivotPointV2).normalized);
+
+                    requiredTurnrate = Mathf.Clamp(turnratePID.GetThrustFactorFixed(-angleToWaypoint * Mathf.Deg2Rad), -climbTurnrate, climbTurnrate);
+                    requiredRollSpeed = Mathf.Clamp(rollSpeedPID.GetThrustFactorFixed(requiredTurnrate - system.turnrate), (1 - (Mathf.Clamp01(1 - Mathf.Sign(system.turnrate)) * Mathf.Pow(Mathf.Abs(system.rollAngle) / climbRollAngle, 3))) * -rollRate.smoothValue, (1 - (Mathf.Clamp01(1 - Mathf.Sign(-system.turnrate)) * Mathf.Pow(Mathf.Abs(system.rollAngle) / climbRollAngle, 3))) * rollRate.smoothValue);
+                }
+                else if (hdgControl == HeadingControlSetting.FlightPlan)
+                {
+                    if (system.mCDU.planPage.currentWaypointIndex == 0)
+                    {
+                        previousFlightPoint = system.mCDU.planPage.waypoints[system.mCDU.planPage.currentWaypointIndex];
+                        system.mCDU.planPage.currentWaypointIndex++;
+                        Debug.Log("Skipping first waypoint");
+                    }
+
+                    if (system.mCDU.planPage.waypoints.Count > 0)
+                    {
+                        if (currentFlightPoint != system.mCDU.planPage.waypoints[system.mCDU.planPage.currentWaypointIndex])
+                        {
+                            currentFlightPoint = system.mCDU.planPage.waypoints[system.mCDU.planPage.currentWaypointIndex];
+                            AIState = "Flying to waypoint " + currentFlightPoint.waypoint.designation;
+
+                            if (currentFlightPoint.connectedSegment != null)
+                            {
+                                currentFlightSegment = currentFlightPoint.connectedSegment;
+                                if (!hasFlightTurn)
+                                {
+                                    if (flightTurnTargetPoint != currentFlightSegment.c1)
+                                    {
+                                        flightTurnTargetPoint = currentFlightSegment.c1;
+                                    }
+                                    hasFlightTurn = true;
+                                }
+                            }
+                            else
+                            {
+                                currentFlightSegment = null;
+                                hasFlightTurn = false;
+                            }
+                        }
+                    }
+
+                    if (currentFlightPoint != null)
+                    {
+                        Vector3 nearestPoint;
+                        Vector2 targetPointV2;
+                        Vector3 correctedPoint;
+                        Vector3 circlePointOnTurn = Vector3.zero;
+
+                        if (flightTurnTargetPoint == Vector3.zero)
+                        {
+                            nearestPoint = NearestPointOnLine(currentFlightPoint.waypoint.position, currentFlightPoint.pointDirection, system.pivotPoint.transform.position);
+                            targetPointV2 = new Vector2(currentFlightPoint.waypoint.position.x, currentFlightPoint.waypoint.position.z);
+
+                            nearestPoint.y = system.pivotPoint.transform.position.y;
+                            correctedPoint = nearestPoint + currentFlightPoint.pointDirection * flightSegmentCorrectionDistance;
+                        }
+                        else
+                        {
+                            circlePointOnTurn = PointProjectedOnTurn(currentFlightSegment, system.pivotPoint.transform.position, flightSegmentCorrectionDistance);
+
+                            if (!inFlightTurn)
+                            {
+                                nearestPoint = NearestPointOnLine(flightTurnTargetPoint, currentFlightPoint.pointDirection, system.pivotPoint.transform.position);
+                                targetPointV2 = new Vector2(flightTurnTargetPoint.x, flightTurnTargetPoint.z);
+
+                                nearestPoint.y = system.pivotPoint.transform.position.y;
+                                correctedPoint = nearestPoint + currentFlightPoint.pointDirection * flightSegmentCorrectionDistance;
+                            }
+                            else
+                            {
+                                nearestPoint = PointProjectedOnTurn(currentFlightSegment,   system.pivotPoint.transform.position, flightSegmentCorrectionDistance);
+                                targetPointV2 = new Vector2(flightTurnTargetPoint.x, flightTurnTargetPoint.z);
+
+                                nearestPoint.y = system.pivotPoint.transform.position.y;
+                                correctedPoint = nearestPoint;
+                            }
+                        }
+
+                        Debug.DrawLine(system.pivotPoint.transform.position, correctedPoint, Color.blue);
+                        distanceToFlightWaypoint = Vector2.Distance(system.pivotPointV2, targetPointV2);
+
+                        if (!hasFlightTurn)
+                        {
+                            if (distanceToFlightWaypoint <= flightSegmentCorrectionDistance)
+                            {
+                                if (system.mCDU.planPage.currentWaypointIndex < system.mCDU.planPage.waypoints.Count - 1)
+                                {
+                                    Debug.Log("Next waypoint");
+                                    previousFlightPoint = system.mCDU.planPage.waypoints[system.mCDU.planPage.currentWaypointIndex];
+                                    system.mCDU.planPage.currentWaypointIndex++;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            int signedDirection = (int)Mathf.Sign(currentFlightSegment.sweepAngle) * SignedDirection(Mathf.PI + currentFlightSegment.stAngle, PointAngle(currentFlightSegment.pc, circlePointOnTurn));
+
+                            if (signedDirection == currentFlightSegment.GetTurnSigned())
+                            {
+                                if (!inFlightTurn)
+                                {
+                                    inFlightTurn = true;
+                                    flightTurnTargetPoint = currentFlightSegment.c2;
+                                }
+                            }
+
+                            if (distanceToFlightWaypoint <= flightSegmentCorrectionDistance && inFlightTurn)
+                            {
+                                if (system.mCDU.planPage.currentWaypointIndex < system.mCDU.planPage.waypoints.Count - 1)
+                                {
+                                    previousFlightPoint = system.mCDU.planPage.waypoints[system.mCDU.planPage.currentWaypointIndex];
+                                    system.mCDU.planPage.currentWaypointIndex++;
+                                    currentFlightSegment = null;
+                                    hasFlightTurn = false;
+                                    inFlightTurn = false;
+                                    flightTurnTargetPoint = Vector3.zero;
+                                }
+                            }
+                        }
+
+                        Vector2 pointV = new Vector2(correctedPoint.x, correctedPoint.z);
+                        Vector3 normalizedVelocity = gameObject.GetComponent<Rigidbody>().velocity.normalized;
+                        flightAngle = Vector2.SignedAngle(new Vector2(normalizedVelocity.x, normalizedVelocity.z), (pointV - system.pivotPointV2).normalized);
+                    }
+
+                    requiredTurnrate = Mathf.Clamp(turnratePID.GetThrustFactorFixed(-flightAngle / 2), -climbTurnrate, climbTurnrate);
+                    requiredRollSpeed = Mathf.Clamp(rollSpeedPID.GetThrustFactorFixed(requiredTurnrate - system.turnrate), (1 - (Mathf.Clamp01(1 - Mathf.Sign(system.turnrate)) * Mathf.Pow(Mathf.Abs(system.rollAngle) / climbRollAngle, 3))) * -rollRate.smoothValue, (1 - (Mathf.Clamp01(1 - Mathf.Sign(-system.turnrate)) * Mathf.Pow(Mathf.Abs(system.rollAngle) / climbRollAngle, 3))) * rollRate.smoothValue);
+                }
+                else if (hdgControl == HeadingControlSetting.LOC)
+                {
+                    if (system.mCDU.planPage.currentWaypointIndex != system.mCDU.planPage.waypoints.Count - 1)
+                    {
+                        system.mCDU.planPage.currentWaypointIndex = system.mCDU.planPage.waypoints.Count - 1;
+                        Debug.Log("Waypoint set to runway");
+                    }
+
+                    requiredTurnrate = Mathf.Clamp(turnratePID.GetThrustFactorFixed(-system.mCDU.planPage.arrivalRunway.GetLocalizerError() / 2), -climbTurnrate, climbTurnrate);
+                    requiredRollSpeed = Mathf.Clamp(rollSpeedPID.GetThrustFactorFixed(requiredTurnrate - system.turnrate), (1 - (Mathf.Clamp01(1 - Mathf.Sign(system.turnrate)) * Mathf.Pow(Mathf.Abs(system.rollAngle) / climbRollAngle, 3))) * -rollRate.smoothValue, (1 - (Mathf.Clamp01(1 - Mathf.Sign(-system.turnrate)) * Mathf.Pow(Mathf.Abs(system.rollAngle) / climbRollAngle, 3))) * rollRate.smoothValue);
+                }
+
+
+                if (takeoffRotate)
+                {
+                    if (system.rateOfClimb > 100)
+                    {
+                        if (!gearupTimerRunning && system.gearDown && !system.gearRetracting)
+                        {
+                            gearupTimer = UnityEngine.Random.Range(averageGearupTime * 0.8f, averageGearupTime * 1.2f);
+                            gearupTimerRunning = true;
+                        }
+
+                        if (system.indicatedAirspeedAverage >= system.autopilot.speed - 5)
+                        {
+                            altControl = AltitudeControlSetting.AccelArrest;
+                        }
+                        else
+                        {
+                            altControl = AltitudeControlSetting.SpeedTarget;
+                        }
+                        targetNoseAttitude.ValueChange(6);
+
+                        takeoffRotate = false;
+                    }
+                    else
+                    {
+                        if (altControl != AltitudeControlSetting.AttitudeHold)
+                        {
+                            altControl = AltitudeControlSetting.AttitudeHold;
+                        }
+                    }
+                }
+
+                if (gearupTimerRunning)
+                {
+                    gearupTimer -= Time.fixedDeltaTime;
+                }
+
+                if (gearupTimer <= 0 && gearupTimerRunning)
+                {
+                    system.SetGearState(false);
+                    gearupTimerRunning = false;
+                    gearupTimer = 0;
+
+                    system.LightSwitch(false, A320Systems.LightType.Takeoff);
+                    system.LightSwitch(false, A320Systems.LightType.Turnoff);
+                    system.LightSwitch(false, A320Systems.LightType.Taxi);
+                }
+
+                if(flightPhase != FlightPhase.Landing)
+                {
+                    AIwheelBrake.ValueChange(0);
+                }
+
+                if (airborne)
+                {
+                    elevatorInput = Mathf.Clamp(elevatorPID.GetThrustFactorFixed(requiredAttitudeSpeed - system.noseAttitudeChange), -1, 1);
+                    rollInput = Mathf.Clamp(rollPID.GetThrustFactorFixed(requiredRollSpeed - system.rollSpeed), -1, 1);
+                }
+            }
+
+            if (!rudderNeutral)
+            {
+                if (altControl == AltitudeControlSetting.Flare)
+                {
+                    system.verticalStabilizer.SetYawDamperStrength(0, true);
+
+                    if(groundRudderControl != 1)
+                    {
+                        groundRudderControl += system.verticalStabilizer.yawDamperToggleSpeed * Time.fixedDeltaTime;
+
+                        if (groundRudderControl > 1)
+                        {
+                            groundRudderControl = 1;
+                        }
+                    }
+                }
+                else if(!system.onGround && altControl != AltitudeControlSetting.Flare)
+                {
+                    if (groundRudderControl != 0)
+                    {
+                        groundRudderControl -= system.verticalStabilizer.yawDamperToggleSpeed * Time.fixedDeltaTime;
+
+                        if (groundRudderControl < 0)
+                        {
+                            groundRudderControl = 0;
+                        }
+                    }
+                }
+
+                AInoseWheelSteering.ValueChange(groundRudderControl * Mathf.Clamp(steeringPID.GetThrustFactorFixed(-angle / 2), -1, 1));
+
+                if (groundRudderControl == 0)
+                {
+                    rudderNeutral = true;
+                    AInoseWheelSteering.ValueChange(0);
+                }
+            }
+
+            noseWheelSteering = AInoseWheelSteering.smoothValue;
+            wheelBrake = AIwheelBrake.smoothValue;
+            system.AileronRollInput(rollInput);
+            system.AileronPitchInput(elevatorInput);
+        }
+
+        system.SteeringInput(noseWheelSteering);
+        system.WheelBrakingInput(wheelBrake);
+    }
+
+    private void Update()
+    {
+        elevatorPID.Update();
+        rollPID.Update();
+        steeringPID.Update();
+        turnratePID.Update();
+        //throttlePID.Update();
+        brakePID.Update();
+
+        groundSegmentCorrectionDistance.Update(SmoothFloat.UpdateType.Update);
+        targetNoseAttitude.Update(SmoothFloat.UpdateType.Update);
+
+        float trackDeg = system.track * Mathf.Rad2Deg;
+        infoText.text = "<b>" + "A320 systems info:" + "</b>" + "\n\n"
+            + "Steering mode: " + system.steerMode + ", value: " + noseWheelSteering.ToString("f3") + "\n"
+            + "Throttle lever position: " + throttle.ThrottlePosition() + ", reverse: " + throttle.inReverse + "\n"
+            + "Engine 1 - N1: " + system.engines[1].N1rpmPercent.ToString("f2") + "%" + ", N2: " + system.engines[1].N2rpmPercent.ToString("f2") + "%" + ", thrust: " + system.engines[1].totalThrust.ToString("f0") + " N" + "\n"
+            + "Engine 2 - N1: " + system.engines[0].N1rpmPercent.ToString("f2") + "%" + ", N2: " + system.engines[0].N2rpmPercent.ToString("f2") + "%" + ", thrust: " + system.engines[0].totalThrust.ToString("f0") + " N" + "\n"
+            + "Aircraft weight: " + system.GetCurrentAircraftWeight().ToString("f0") + "kg" + ", payload: " + system.payload.ToString("f0") + "kg" + ", pax: " + system.pax.ToString("f0") + ", FOB: " + system.fobLiters.ToString("f0") + "l" + "\n"
+            + "Aircraft ground speed: " + system.groundSpeed.ToString("f1") + " kts, TAS: " + system.trueAirspeed.ToString("f1") + " kts, IAS: " + system.indicatedAirspeed.ToString("f1") + " kts, mach: " + system.machSpeed.ToString("f3") + ", heading: " + system.heading.ToString("f0") + "°" + ", track: " + trackDeg.ToString("f0") + "°" + "\n"
+            + "Indicated altitude: " + system.indicatedAltitude.ToString("f0") + " ft, radio altimeter: " + system.radioAltimeter.ToString("f0") + " ft, true altitude: " + system.trueAltitude.ToString("f0") + " ft" + "\n"
+            + "Rate of climb: " + system.rateOfClimb.ToString("f0") + " ft/min" + "\n"
+            + "Fuselage aerodynamics: AoA: " + system.fuselageAngleOfAttack.ToString("f1") + "°, attitude: " + system.noseAttitude.ToString("f1") + "°, roll: " + system.rollAngle.ToString("f1") + "°" + ", side slip: " + system.correctedSideSlip.ToString("f1") + "°" + "\n" + "\n"
+            + "Weather: " + "\n"
+            + "Air pressure: " + system.affectingWeather.absolutePressure_hPa.ToString("f0") + " hPa" + "\n"
+            + "Temperature: " + system.affectingWeather.temperatureC.ToString("f1") + "°C" + "\n"
+            + "Density: " + system.affectingWeather.airDensity.ToString("f3") + " kg/m³" + "\n"
+            + "Wind: " + system.affectingWeather.windSpeed.ToString("f0") + " kts @ " + system.affectingWeather.windDirection.ToString("f0") + "°" + "\n" + "\n"
+            + "Suspension: " + "\n"
+            + "Front:   Ltire - Suspension comp factor: " + system.frontGear.wheels[1].suspensionCompressionFactor.ToString("f3") + ", tire compression: " + system.frontGear.wheels[1].tireCompression.ToString("f3") + "   Rtire - Suspension comp factor: " + system.frontGear.wheels[0].suspensionCompressionFactor.ToString("f3") + ", tire compression: " + system.frontGear.wheels[0].tireCompression.ToString("f3") + "\n"
+            + "Front suspension force: " + system.frontGear.suspensionForce.ToString("f0") + " Nm";
+
+        if (controlType == ControlType.Player)
+        {
+            if (Input.GetButtonDown(joystickReverseToggle))
+            {
+                throttle.ToggleReverse();
+            }
+
+            if (Input.GetButtonDown(joystickGearUp))
+            {
+                system.SetGearState(false);
+            }
+
+            if (Input.GetButtonDown(joystickGearDown))
+            {
+                system.SetGearState(true);
+            }
+
+            if (Input.GetButtonDown(joystickNoseWheelSteeringToggle))
+            {
+                system.ToggleSteeringMode();
+            }
+
+            if (Input.GetButton(joystickNormalWheelBrake))
+            {
+                if (Input.GetButton(joystickMaxWheelBrake))
+                {
+                    wheelBrake = 1;
+                }
+                else
+                {
+                    wheelBrake = normalWheelBrakeAmount;
+                }
+            }
+            else
+            {
+                wheelBrake = 0;
+            }
+
+            if (Input.GetButtonDown(joystickSpoilersInc))
+            {
+                system.SetSpoilerSwitch(system.spoilerSwitch + 1);
+            }
+            if (Input.GetButtonDown(joystickSpoilersDec))
+            {
+                system.SetSpoilerSwitch(system.spoilerSwitch - 1);
+            }
+
+            if (Input.GetButtonDown(joystickFlapsInc))
+            {
+                system.SetFlapsSwitch(system.flapsSwitch + 1);
+            }
+            if (Input.GetButtonDown(joystickFlapsDec))
+            {
+                system.SetFlapsSwitch(system.flapsSwitch - 1);
+            }
+
+            if (eng1Main.isOn)
+            {
+                if (system.GetEngineState(Side.Left) == 0)
+                {
+                    system.EngineStart(Side.Left);
+                }
+            }
+            else
+            {
+                if (system.GetEngineState(Side.Left) == 2)
+                {
+                    system.EngineShutdown(Side.Left);
+                }
+            }
+
+            if (eng2Main.isOn)
+            {
+                if (system.GetEngineState(Side.Right) == 0)
+                {
+                    system.EngineStart(Side.Right);
+                }
+            }
+            else
+            {
+                if (system.GetEngineState(Side.Right) == 2)
+                {
+                    system.EngineShutdown(Side.Right);
+                }
+            }
+
+            if (apuStart.isOn)
+            {
+                if (system.apu.state == 0)
+                {
+                    system.APUStateSwitch(true);
+                }
+            }
+            else
+            {
+                if (system.apu.state == 2)
+                {
+                    system.APUStateSwitch(false);
+                }
+            }
+
+            if (system.apu.state == 0)
+            {
+                if (apuStart.isOn)
+                {
+                    apuStart.isOn = false;
+                }
+            }
+            else if (system.apu.state != 0)
+            {
+                if (!apuStart.isOn)
+                {
+                    apuStart.isOn = true;
+                }
+            }
+
+            if (system.apu.apuBleed != apuBleed.isOn)
+            {
+                system.apu.SetBleed(apuBleed.isOn);
+            }
+
+            if (system.batteriesOn != batteriesOn.isOn)
+            {
+                system.BatteriesSwitch(batteriesOn.isOn);
+            }
+
+            if (system.strobeLightOn != strobeLight.isOn)
+            {
+                system.LightSwitch(strobeLight.isOn, A320Systems.LightType.Strobe);
+            }
+
+            if (system.beaconLightOn != beaconLight.isOn)
+            {
+                system.LightSwitch(beaconLight.isOn, A320Systems.LightType.Beacon);
+            }
+
+            if (system.navLightOn != navLogoLight.isOn)
+            {
+                system.LightSwitch(navLogoLight.isOn, A320Systems.LightType.Nav);
+            }
+
+            if (system.turnoffLightsOn != rwyTurnoffLight.isOn)
+            {
+                system.LightSwitch(rwyTurnoffLight.isOn, A320Systems.LightType.Turnoff);
+            }
+
+            if (system.landLightOn != landLight.isOn)
+            {
+                system.LightSwitch(landLight.isOn, A320Systems.LightType.Land);
+            }
+
+            if (system.taxiLightOn != taxiLight.isOn)
+            {
+                system.LightSwitch(taxiLight.isOn, A320Systems.LightType.Taxi);
+            }
+
+            if (system.takeoffLightOn != takeoffLight.isOn)
+            {
+                system.LightSwitch(takeoffLight.isOn, A320Systems.LightType.Takeoff);
+            }
+        }
+
+        foreach (ReceivedCommand rc in commandQueue)
+        {
+            if (rc.CanReplyToCommand())
+            {
+                ReplyToATCCommand(rc);
+                commandQueue.Remove(rc);
+
+                return;
+            }
+        }
+    }
+
+    static Vector3 NearestPointOnLine(Vector3 linePnt, Vector3 lineDir, Vector3 pnt)
+    {
+        //lineDir.Normalize();//this needs to be a unit vector
+        var v = pnt - linePnt;
+        var d = Vector3.Dot(v, lineDir);
+        return linePnt + lineDir * d;
+    }
+
+    public int SignedDirection(float startAngle, float currentAngle)
+    {
+        float diff = (startAngle - currentAngle) % (Mathf.PI * 2);
+
+        if(diff > Mathf.PI)
+        {
+            diff = -((Mathf.PI * 2) - diff);
+        }
+
+        return (int)Mathf.Sign(diff);
+    }
+
+    public float ShortestAngle(float start, float target)
+    {
+        float modDiff = (target - start) % (Mathf.PI * 2);
+        float shortestDistance = Mathf.PI - Mathf.Abs(Mathf.Abs(modDiff) - Mathf.PI);
+        return (modDiff + (Mathf.PI * 2)) % (Mathf.PI * 2) < Mathf.PI ? shortestDistance *= 1 : shortestDistance *= -1;
+    }
+
+    Vector3 ClosestPointOnCircle(Vector3 circleCenter, float circleRadius, Vector3 point)
+    {
+        return circleCenter + (circleRadius * (point - circleCenter).normalized);
+    }
+
+    Vector3 ClosestPointOnCircle(Vector3 circleCenter, float circleRadius, Vector3 point, float distanceOffset)
+    {
+        return circleCenter + (circleRadius * (Quaternion.Euler(0, distanceOffset / (2 * Mathf.PI * circleRadius) * 360, 0) * (point - circleCenter).normalized));
+    }
+
+    Vector3 PointProjectedOnTurn(MCDU.FPlanPage.FlightTurnSegment segment, Vector3 point, float offset)
+    {
+        Vector3 pc = segment.pc;
+        pc.y = point.y;
+        Vector3 c1 = segment.c1;
+        c1.y = point.y;
+        float angleDiff = PointAngleDiff(pc, c1, point) + ((segment.GetTurnDirection() * offset) / (2 * Mathf.PI * segment.turnRadius) * (Mathf.PI * 2));
+        float pointX = (float)(pc.x + Mathf.Cos(segment.stAngle - angleDiff) * segment.turnRadius);
+        float pointY = (float)(pc.z + Mathf.Sin(segment.stAngle - angleDiff) * segment.turnRadius);
+        return new Vector3(pointX, point.y, pointY);
+    }
+
+    float PointAngle(Vector3 anglePoint, Vector3 point)
+    {
+        return Mathf.PI + Mathf.Atan2(point.z - anglePoint.z, point.x - anglePoint.x);
+    }
+
+    float PointAngleSign(Vector3 anglePoint, Vector3 point)
+    {
+        return Mathf.Atan2(point.z - anglePoint.z, point.x - anglePoint.x);
+    }
+
+    float PointAngleDiff(Vector3 anglePoint, Vector3 point1, Vector3 point2)
+    {
+        return (Mathf.PI + Mathf.Atan2(point1.z - anglePoint.z, point1.x - anglePoint.x)) - (Mathf.PI + Mathf.Atan2(point2.z - anglePoint.z, point2.x - anglePoint.x));
+    }
+
+    Waypoint.ConnectedSegment ClosestSegment()
+    {
+        if(currentTargetPoint != null && currentTargetPoint.segmentsByAngle.Count > 0)
+        {
+            float closestDist = Mathf.PI * 2;
+            int closestIndex = 0;
+
+            for(int i = 0; i < currentTargetPoint.segmentsByAngle.Count; i++)
+            {
+                float diff = (Mathf.PI + currentTargetPoint.segmentsByAngle[i].angle - PointAngle(currentTargetPoint.transform.position, system.pivotPoint.transform.position)) % (Mathf.PI * 2);
+
+                if (diff > Mathf.PI)
+                {
+                    diff = -((Mathf.PI * 2) - diff);
+                }
+
+                diff = Mathf.Abs(diff);
+
+                if (diff < closestDist)
+                {
+                    closestDist = diff;
+                    closestIndex = i;
+                }
+            }
+
+            return currentTargetPoint.segmentsByAngle[closestIndex];
+        }
+
+        return null;
+    }
+
+    public void HandTaxiInstructions(Waypoint[] instruction)
+    {
+        taxiInstructions.Clear();
+        taxiInstructions.AddRange(instruction);
+    }
+
+    public float ClosestToZero(float val1, float val2)
+    {
+        if(Mathf.Abs(val1) < Mathf.Abs(val2))
+        {
+            return val1;
+        }
+        else
+        {
+            return val2;
+        }
+    }
+
+    public float ClosestToZero(float val1, float val2, float val3)
+    {
+        if (Mathf.Abs(val1) < Mathf.Abs(val2))
+        {
+            if(Mathf.Abs(val1) < Mathf.Abs(val3))
+            {
+                return val1;
+            }
+            else
+            {
+                return val3;
+            }
+        }
+        else
+        {
+            if (Mathf.Abs(val2) < Mathf.Abs(val3))
+            {
+                return val2;
+            }
+            else
+            {
+                return val3;
+            }
+        }
+    }
+
+    public void ReceiveATCCommand(RadarController.FullCommand cmd)
+    {
+        commandQueue.Add(new ReceivedCommand(cmd, avgCommandReplyTime));
+    }
+
+    public void ReplyToATCCommand(ReceivedCommand receivedCommand)
+    {
+        StartCoroutine(radar.ReplyToCommand(receivedCommand.fullCommand));
+
+        foreach (RadarController.ATCCommand cmd in receivedCommand.fullCommand.commandBuffer)
+        {
+            if (cmd.commandType == RadarController.ATCCommand.CommandType.Altitude)
+            {
+                system.autopilot.altitude = cmd.currentValue;
+            }
+            else if (cmd.commandType == RadarController.ATCCommand.CommandType.Heading)
+            {
+                system.autopilot.heading = cmd.currentValue;
+            }
+        }
+    }
+}
